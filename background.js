@@ -1,5 +1,5 @@
 const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
-const SUPABASE_KEY = "SUA_PUBLISHABLE_KEY";
+const SUPABASE_KEY = "sb_publishable_a1G3noc-lXu2NWCBO7k6Yg_xi7-5fBB";
 
 // TEMPORÁRIO
 // Depois vamos obter automaticamente do usuário logado
