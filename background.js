@@ -22,15 +22,14 @@ async function enviarParaSupabase(registro) {
           "Content-Type": "application/json",
           "Prefer": "return=representation"
         },
-        body: JSON.stringify({
-          user_id: USER_ID,
-          domain: registro.hostname,
-          started_at: registro.inicio,
-          ended_at: registro.fim,
-          duration_seconds: registro.duracaoSegundos,
-          is_active: false,
-          source: "chrome-extension"
-        })
+   body: JSON.stringify({
+  user_id: USER_ID,
+  domain: registro.hostname,
+  started_at: registro.inicio,
+  ended_at: registro.fim,
+  is_active: false,
+  source: "chrome-extension"
+})
       }
     );
 
