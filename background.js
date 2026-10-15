@@ -1,6 +1,23 @@
 let currentTab = null;
 let startTime = null;
 
+const categorias = {
+  "outlook.office.com": "Email",
+  "mail.google.com": "Email",
+
+  "teams.microsoft.com": "Reuniao",
+  "meet.google.com": "Reuniao",
+
+  "web.whatsapp.com": "Comunicacao",
+
+  "github.com": "Desenvolvimento",
+  "github.dev": "Desenvolvimento",
+
+  "chat.openai.com": "IA",
+  "chatgpt.com": "IA",
+  "claude.ai": "IA"
+};
+
 async function salvarRegistro(registro) {
   try {
     const storage = await chrome.storage.local.get("registros");
@@ -30,15 +47,16 @@ async function registrarTroca(tabId) {
 
     const agora = new Date();
 
-    // Salva o registro anterior
     if (currentTab && startTime) {
       const duracaoSegundos = Math.floor(
         (agora.getTime() - new Date(startTime).getTime()) / 1000
       );
 
+      const domain = new URL(currentTab.url).hostname;
+
       const registro = {
-        domain: new URL(currentTab.url).hostname,
-        titulo: currentTab.title,
+        domain,
+        categoria: categorias[domain] || "Nao Classificado",
         inicio: startTime,
         fim: agora.toISOString(),
         duracaoSegundos,
@@ -50,7 +68,6 @@ async function registrarTroca(tabId) {
       }
     }
 
-    // Atualiza a aba atual
     currentTab = {
       url: tab.url,
       title: tab.title,
