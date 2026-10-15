@@ -3,16 +3,21 @@
   "name": "Portal Produtividade",
   "version": "1.0.0",
   "description": "Monitoramento de sites ativos para o Portal de Produtividade.",
+
   "permissions": [
     "tabs",
     "storage"
   ],
+
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "https://*.supabase.co/*"
   ],
+
   "background": {
     "service_worker": "background.js"
   },
+
   "action": {
     "default_popup": "popup.html"
   }

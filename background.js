@@ -1,5 +1,51 @@
+const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
+const SUPABASE_KEY = "SUA_PUBLISHABLE_KEY";
+
+// TEMPORÁRIO
+// Depois vamos obter automaticamente do usuário logado
+const USER_ID = "662bb8f3-684f-4a31-a34d-98195f226109";
+
 let currentTab = null;
 let startTime = null;
+
+/**
+ * Envia registro para o Supabase
+ */
+async function enviarParaSupabase(registro) {
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/web_events`,
+      {
+        method: "POST",
+        headers: {
+          "apikey": SUPABASE_KEY,
+          "Content-Type": "application/json",
+          "Prefer": "return=representation"
+        },
+        body: JSON.stringify({
+          user_id: USER_ID,
+          domain: registro.hostname,
+          started_at: registro.inicio,
+          ended_at: registro.fim,
+          duration_seconds: registro.duracaoSegundos,
+          is_active: false,
+          source: "chrome-extension"
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const erro = await response.text();
+      console.error("❌ Erro Supabase:", erro);
+      return;
+    }
+
+    console.log("✅ Enviado para Supabase:", registro.hostname);
+
+  } catch (error) {
+    console.error("❌ Falha ao enviar:", error);
+  }
+}
 
 /**
  * Identifica aplicação automaticamente
@@ -9,7 +55,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
   const hostLower = hostname.toLowerCase();
   const tituloLower = titulo.toLowerCase();
 
-  // Microsoft
   if (hostLower.includes("teams")) {
     return {
       empresa: "Microsoft",
@@ -45,7 +90,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // Google
   if (
     hostLower.includes("docs.google.com") &&
     urlLower.includes("/spreadsheets/")
@@ -103,7 +147,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // GitHub
   if (hostLower.includes("github")) {
     return {
       empresa: "GitHub",
@@ -112,7 +155,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // GitLab
   if (hostLower.includes("gitlab")) {
     return {
       empresa: "GitLab",
@@ -121,7 +163,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // IA
   if (
     hostLower.includes("chatgpt") ||
     hostLower.includes("openai")
@@ -149,7 +190,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // Comunicação
   if (hostLower.includes("whatsapp")) {
     return {
       empresa: "Meta",
@@ -174,7 +214,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // CRM
   if (hostLower.includes("salesforce")) {
     return {
       empresa: "Salesforce",
@@ -191,7 +230,6 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  // ERP
   if (
     hostLower.includes("totvs") ||
     tituloLower.includes("totvs")
@@ -211,7 +249,7 @@ function identificarAplicacao(url, hostname, titulo = "") {
 }
 
 /**
- * Extrai informações da URL
+ * Extrai dados da URL
  */
 function obterDadosUrl(url) {
   try {
@@ -233,6 +271,9 @@ function obterDadosUrl(url) {
   }
 }
 
+/**
+ * Salva localmente e envia ao Supabase
+ */
 async function salvarRegistro(registro) {
   try {
     const storage = await chrome.storage.local.get("registros");
@@ -247,14 +288,18 @@ async function salvarRegistro(registro) {
 
     console.log("Registro salvo:", registro);
 
+    await enviarParaSupabase(registro);
+
   } catch (error) {
-    console.error("Erro ao salvar registro:", error);
+    console.error("Erro ao salvar:", error);
   }
 }
 
+/**
+ * Registra troca de abas
+ */
 async function registrarTroca(tabId) {
   try {
-
     const tab = await chrome.tabs.get(tabId);
 
     if (!tab.url || tab.url.startsWith("chrome://")) {
@@ -264,7 +309,6 @@ async function registrarTroca(tabId) {
     const agora = new Date();
 
     if (currentTab && startTime) {
-
       const duracaoSegundos = Math.floor(
         (
           agora.getTime() -
@@ -273,7 +317,6 @@ async function registrarTroca(tabId) {
       );
 
       if (duracaoSegundos >= 5) {
-
         const dados = obterDadosUrl(currentTab.url);
 
         const info = identificarAplicacao(
@@ -332,4 +375,4 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 
-console.log("Portal Produtividade iniciado!");
+console.log("🚀 Portal Produtividade iniciado!");
