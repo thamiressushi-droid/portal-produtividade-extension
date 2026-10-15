@@ -1,3 +1,6 @@
+const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
+const SUPABASE_KEY = "sb_publishable_a1G3noc-lXu2NWCBO7k6Yg_xi7-5fBB";
+
 async function obterUserId() {
   const dados = await chrome.storage.local.get([
     "portalUserId",
