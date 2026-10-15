@@ -1,7 +1,64 @@
 (() => {
-  console.log("Portal identity bridge carregado");
+  const identityMessageType = "PORTAL_IDENTITY_CHANGED";
+
+  console.info("[Portal Extensão][content] Bridge carregado", {
+    pageUrl: window.location.href,
+    expectedMessageType: identityMessageType
+  });
 
   window.addEventListener("message", (event) => {
-    console.log("Mensagem recebida:", event.data);
+    const data = event.data;
+    const messageType =
+      typeof data === "object" && data !== null
+        ? data.type
+        : undefined;
+
+    console.info("[Portal Extensão][content] postMessage recebido", {
+      origin: event.origin,
+      fromPage: event.source === window,
+      messageType
+    });
+
+    if (
+      event.source !== window ||
+      messageType !== identityMessageType
+    ) {
+      return;
+    }
+
+    console.info("[Portal Extensão][content] Encaminhando identidade ao background", {
+      hasUserId: typeof data.userId === "string",
+      userIdIsNull: data.userId === null
+    });
+
+    chrome.runtime.sendMessage(
+      {
+        type: identityMessageType,
+        userId: data.userId
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+
+        if (runtimeError) {
+          console.error(
+            "[Portal Extensão][content] Falha em chrome.runtime.sendMessage",
+            runtimeError.message
+          );
+          return;
+        }
+
+        if (!response?.ok) {
+          console.error(
+            "[Portal Extensão][content] Background não confirmou a persistência",
+            response
+          );
+          return;
+        }
+
+        console.info(
+          "[Portal Extensão][content] Background confirmou identidade persistida"
+        );
+      }
+    );
   });
 })();

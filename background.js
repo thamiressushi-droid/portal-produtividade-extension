@@ -407,7 +407,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 chrome.runtime.onMessage.addListener(
-  (message, sender) => {
+  (message, sender, sendResponse) => {
     if (
       message?.type !==
       "PORTAL_IDENTITY_CHANGED"
@@ -426,28 +426,79 @@ chrome.runtime.onMessage.addListener(
       }
     );
 
+    if (
+      message.userId !== null &&
+      typeof message.userId !== "string"
+    ) {
+      console.error(
+        "[Portal Extensão][background] Identidade rejeitada: userId deve ser string ou null"
+      );
+      sendResponse({
+        ok: false,
+        stage: "validation"
+      });
+      return;
+    }
+
+    console.info(
+      "[Portal Extensão][background] Iniciando gravação no chrome.storage.local",
+      {
+        operation:
+          message.userId === null ? "remove" : "set"
+      }
+    );
+
     const operation =
       message.userId === null
-        ? chrome.storage.local.remove(
-            "portalUserId"
-          )
+        ? chrome.storage.local.remove("portalUserId")
         : chrome.storage.local.set({
-            portalUserId:
-              message.userId
+            portalUserId: message.userId
           });
 
-    void operation.then(
-      () =>
+    void operation
+      .then(async () => {
+        const stored = await chrome.storage.local.get("portalUserId");
+        const persisted =
+          message.userId === null
+            ? !Object.hasOwn(stored, "portalUserId")
+            : stored.portalUserId === message.userId;
+
+        if (!persisted) {
+          console.error(
+            "[Portal Extensão][background] Storage não confirmou o valor esperado"
+          );
+          sendResponse({
+            ok: false,
+            stage: "storage_verification"
+          });
+          return;
+        }
+
         console.info(
-          "[Portal Extensão] Storage atualizado"
-        ),
-      (error) =>
+          "[Portal Extensão][background] Identidade persistida e verificada"
+        );
+        sendResponse({
+          ok: true,
+          stage: "storage"
+        });
+      })
+      .catch((error) => {
         console.error(
-          "[Portal Extensão] Erro:",
+          "[Portal Extensão][background] Erro ao atualizar chrome.storage.local",
           error
-        )
-    );
+        );
+        sendResponse({
+          ok: false,
+          stage: "storage"
+        });
+      });
+
+    return true;
   }
+);
+
+console.info(
+  "[Portal Extensão][background] Listener PORTAL_IDENTITY_CHANGED registrado"
 );
 
 console.log("🚀 Portal Produtividade iniciado!");
