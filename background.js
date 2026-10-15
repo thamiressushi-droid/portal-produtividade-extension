@@ -1,9 +1,16 @@
 const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
 const SUPABASE_KEY = "sb_publishable_a1G3noc-lXu2NWCBO7k6Yg_xi7-5fBB";
 
-// TEMPORÁRIO
-// Depois vamos obter automaticamente do usuário logado
-const USER_ID = "662bb8f3-684f-4a31-a34d-98195f226109";
+async function obterUserId() {
+  const dados = await chrome.storage.local.get("user_id");
+
+  if (dados.user_id) {
+    return dados.user_id;
+  }
+
+  // TEMPORÁRIO
+  return "662bb8f3-684f-4a31-a34d-98195f226109";
+}
 
 let currentTab = null;
 let startTime = null;
@@ -13,6 +20,8 @@ let startTime = null;
  */
 async function enviarParaSupabase(registro) {
   try {
+    const userId = await obterUserId();
+
     const response = await fetch(
       `${SUPABASE_URL}/rest/v1/web_events`,
       {
@@ -22,27 +31,39 @@ async function enviarParaSupabase(registro) {
           "Content-Type": "application/json",
           "Prefer": "return=representation"
         },
-   body: JSON.stringify({
-  user_id: USER_ID,
-  domain: registro.hostname,
-  started_at: registro.inicio,
-  ended_at: registro.fim,
-  is_active: false,
-  source: "chrome-extension"
-})
+        body: JSON.stringify({
+          user_id: userId,
+          domain: registro.hostname,
+          started_at: registro.inicio,
+          ended_at: registro.fim,
+          is_active: false,
+          source: "chrome-extension"
+        })
       }
     );
 
     if (!response.ok) {
       const erro = await response.text();
-      console.error("❌ Erro Supabase:", erro);
+
+      console.error(
+        "❌ Erro Supabase:",
+        response.status,
+        erro
+      );
+
       return;
     }
 
-    console.log("✅ Enviado para Supabase:", registro.hostname);
+    console.log(
+      "✅ Enviado para Supabase:",
+      registro.hostname
+    );
 
   } catch (error) {
-    console.error("❌ Falha ao enviar:", error);
+    console.error(
+      "❌ Falha ao enviar:",
+      error
+    );
   }
 }
 
@@ -309,10 +330,7 @@ async function registrarTroca(tabId) {
 
     if (currentTab && startTime) {
       const duracaoSegundos = Math.floor(
-        (
-          agora.getTime() -
-          new Date(startTime).getTime()
-        ) / 1000
+        (agora.getTime() - new Date(startTime).getTime()) / 1000
       );
 
       if (duracaoSegundos >= 5) {
