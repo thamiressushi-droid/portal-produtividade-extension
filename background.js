@@ -1,14 +1,28 @@
-const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
-const SUPABASE_KEY = "sb_publishable_a1G3noc-lXu2NWCBO7k6Yg_xi7-5fBB";
-
 async function obterUserId() {
-  const dados = await chrome.storage.local.get("user_id");
+  const dados = await chrome.storage.local.get([
+    "portalUserId",
+    "user_id"
+  ]);
+
+  console.log("📦 Storage:", dados);
+
+  if (dados.portalUserId) {
+    console.log(
+      "✅ Usuário recebido do portal:",
+      dados.portalUserId
+    );
+
+    return dados.portalUserId;
+  }
 
   if (dados.user_id) {
     return dados.user_id;
   }
 
-  // TEMPORÁRIO
+  console.warn(
+    "⚠️ Nenhum usuário recebido do portal. Usando UUID temporário."
+  );
+
   return "662bb8f3-684f-4a31-a34d-98195f226109";
 }
 
@@ -391,5 +405,49 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     registrarTroca(tabId);
   }
 });
+
+chrome.runtime.onMessage.addListener(
+  (message, sender) => {
+    if (
+      message?.type !==
+      "PORTAL_IDENTITY_CHANGED"
+    ) {
+      return;
+    }
+
+    console.info(
+      "[Portal Extensão] Mensagem recebida",
+      {
+        senderUrl: sender?.url,
+        hasUserId:
+          typeof message.userId === "string",
+        userIdIsNull:
+          message.userId === null
+      }
+    );
+
+    const operation =
+      message.userId === null
+        ? chrome.storage.local.remove(
+            "portalUserId"
+          )
+        : chrome.storage.local.set({
+            portalUserId:
+              message.userId
+          });
+
+    void operation.then(
+      () =>
+        console.info(
+          "[Portal Extensão] Storage atualizado"
+        ),
+      (error) =>
+        console.error(
+          "[Portal Extensão] Erro:",
+          error
+        )
+    );
+  }
+);
 
 console.log("🚀 Portal Produtividade iniciado!");
