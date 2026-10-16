@@ -419,9 +419,10 @@ chrome.runtime.onMessage.addListener(
     }
 
     console.info(
-      "[Portal Extensão] Mensagem recebida",
+      "[Portal Extensão][background] Mensagem recebida",
       {
         senderUrl: sender?.url,
+        senderTabUrl: sender?.tab?.url,
         hasUserId:
           typeof message.userId === "string",
         userIdIsNull:
@@ -501,7 +502,11 @@ chrome.runtime.onMessage.addListener(
 );
 
 console.info(
-  "[Portal Extensão][background] Listener PORTAL_IDENTITY_CHANGED registrado"
+  "[Portal Extensão][background] Listener PORTAL_IDENTITY_CHANGED registrado",
+  {
+    event: "PORTAL_IDENTITY_CHANGED",
+    storage: "chrome.storage.local"
+  }
 );
 
 console.log("🚀 Portal Produtividade iniciado!");

@@ -17,7 +17,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://*.app.github.dev/*"
+        "https://*.app.github.dev/*",
+        "https://portal-produtividade.gehaka.workers.dev/*"
       ],
       "js": [
         "content-portal-identity.js"

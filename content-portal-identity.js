@@ -19,10 +19,21 @@
       messageType
     });
 
-    if (
-      event.source !== window ||
-      messageType !== identityMessageType
-    ) {
+    if (event.source !== window) {
+      console.warn(
+        "[Portal Extensão][content] postMessage ignorado: origem não é a janela da página"
+      );
+      return;
+    }
+
+    if (messageType !== identityMessageType) {
+      console.info(
+        "[Portal Extensão][content] postMessage ignorado: tipo inesperado",
+        {
+          expectedMessageType: identityMessageType,
+          receivedMessageType: messageType
+        }
+      );
       return;
     }
 
@@ -31,34 +42,44 @@
       userIdIsNull: data.userId === null
     });
 
-    chrome.runtime.sendMessage(
-      {
-        type: identityMessageType,
-        userId: data.userId
-      },
-      (response) => {
-        const runtimeError = chrome.runtime.lastError;
+    try {
+      console.info(
+        "[Portal Extensão][content] Chamando chrome.runtime.sendMessage"
+      );
+      chrome.runtime.sendMessage(
+        {
+          type: identityMessageType,
+          userId: data.userId
+        },
+        (response) => {
+          const runtimeError = chrome.runtime.lastError;
 
-        if (runtimeError) {
-          console.error(
-            "[Portal Extensão][content] Falha em chrome.runtime.sendMessage",
-            runtimeError.message
+          if (runtimeError) {
+            console.error(
+              "[Portal Extensão][content] Falha em chrome.runtime.sendMessage",
+              runtimeError.message
+            );
+            return;
+          }
+
+          if (!response?.ok) {
+            console.error(
+              "[Portal Extensão][content] Background não confirmou a persistência",
+              response
+            );
+            return;
+          }
+
+          console.info(
+            "[Portal Extensão][content] Background confirmou identidade persistida"
           );
-          return;
         }
-
-        if (!response?.ok) {
-          console.error(
-            "[Portal Extensão][content] Background não confirmou a persistência",
-            response
-          );
-          return;
-        }
-
-        console.info(
-          "[Portal Extensão][content] Background confirmou identidade persistida"
-        );
-      }
-    );
+      );
+    } catch (error) {
+      console.error(
+        "[Portal Extensão][content] Erro síncrono em chrome.runtime.sendMessage",
+        error
+      );
+    }
   });
 })();
