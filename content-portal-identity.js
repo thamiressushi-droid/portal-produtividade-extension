@@ -1,4 +1,5 @@
 (() => {
+console.log("🔥🔥🔥 VERSAO NOVA DA EXTENSAO 🔥🔥🔥");
   const pageIdentityMessageType = "identity";
   const backgroundIdentityMessageType = "PORTAL_IDENTITY_CHANGED";
 
