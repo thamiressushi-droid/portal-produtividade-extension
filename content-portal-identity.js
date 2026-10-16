@@ -1,9 +1,10 @@
 (() => {
-  const identityMessageType = "PORTAL_IDENTITY_CHANGED";
+  const pageIdentityMessageType = "identity";
+  const backgroundIdentityMessageType = "PORTAL_IDENTITY_CHANGED";
 
   console.info("[Portal Extensão][content] Bridge carregado", {
     pageUrl: window.location.href,
-    expectedMessageType: identityMessageType
+    expectedMessageType: pageIdentityMessageType
   });
 
   window.addEventListener("message", (event) => {
@@ -26,11 +27,11 @@
       return;
     }
 
-    if (messageType !== identityMessageType) {
+    if (messageType !== pageIdentityMessageType) {
       console.info(
         "[Portal Extensão][content] postMessage ignorado: tipo inesperado",
         {
-          expectedMessageType: identityMessageType,
+          expectedMessageType: pageIdentityMessageType,
           receivedMessageType: messageType
         }
       );
@@ -48,7 +49,7 @@
       );
       chrome.runtime.sendMessage(
         {
-          type: identityMessageType,
+          type: backgroundIdentityMessageType,
           userId: data.userId
         },
         (response) => {
