@@ -29,8 +29,177 @@ async function obterUserId() {
   return "662bb8f3-684f-4a31-a34d-98195f226109";
 }
 
-let currentTab = null;
-let startTime = null;
+const INACTIVITY_LIMIT_SECONDS = 300;
+const INACTIVITY_ALARM = "portal-session-inactivity";
+
+let currentSession = null;
+let sessionOperation = Promise.resolve();
+
+const sessionReady = chrome.storage.local
+  .get("activeSession")
+  .then(async ({ activeSession }) => {
+    currentSession = activeSession || null;
+
+    if (currentSession) {
+      await agendarEncerramento();
+    }
+  })
+  .catch((error) => {
+    console.error("Erro ao recuperar sessão ativa:", error);
+    currentSession = null;
+  });
+
+function serializarOperacao(callback) {
+  sessionOperation = sessionOperation
+    .then(() => sessionReady)
+    .then(callback)
+    .catch((error) => {
+      console.error("Erro ao atualizar sessão:", error);
+    });
+
+  return sessionOperation;
+}
+
+async function persistirSessao() {
+  if (currentSession) {
+    await chrome.storage.local.set({
+      activeSession: currentSession
+    });
+    return;
+  }
+
+  await chrome.storage.local.remove("activeSession");
+}
+
+async function agendarEncerramento() {
+  if (!currentSession) {
+    await chrome.alarms.clear(INACTIVITY_ALARM);
+    return;
+  }
+
+  const deadline =
+    new Date(currentSession.lastActivity).getTime() +
+    INACTIVITY_LIMIT_SECONDS * 1000;
+
+  await chrome.alarms.create(INACTIVITY_ALARM, {
+    when: deadline
+  });
+}
+
+async function encerrarSessao(endTime = Date.now()) {
+  if (!currentSession) {
+    return;
+  }
+
+  const sessao = currentSession;
+  const lastActivity = new Date(sessao.lastActivity).getTime();
+  const fim = Math.min(
+    endTime,
+    lastActivity + INACTIVITY_LIMIT_SECONDS * 1000
+  );
+  const duracaoSegundos = Math.floor(
+    (fim - new Date(sessao.inicio).getTime()) / 1000
+  );
+
+  currentSession = null;
+  await persistirSessao();
+  await chrome.alarms.clear(INACTIVITY_ALARM);
+
+  if (duracaoSegundos < 5) {
+    return;
+  }
+
+  const dados = obterDadosUrl(sessao.url);
+  const info = identificarAplicacao(
+    sessao.url,
+    dados.hostname,
+    sessao.titulo
+  );
+  const registro = {
+    url: dados.url,
+    hostname: dados.hostname,
+    pathname: dados.pathname,
+    protocolo: dados.protocolo,
+    empresa: info.empresa,
+    aplicacao: info.aplicacao,
+    categoria: info.categoria,
+    titulo: sessao.titulo,
+    inicio: sessao.inicio,
+    fim: new Date(fim).toISOString(),
+    duracaoSegundos
+  };
+
+  void salvarRegistro(registro);
+}
+
+async function iniciarSessao(tab, startTime = Date.now()) {
+  if (!tab?.url || tab.url.startsWith("chrome://")) {
+    return;
+  }
+
+  const timestamp = new Date(startTime).toISOString();
+  currentSession = {
+    tabId: tab.id,
+    url: tab.url,
+    titulo: tab.title || "",
+    inicio: timestamp,
+    lastActivity: timestamp
+  };
+
+  await persistirSessao();
+  await agendarEncerramento();
+
+  const dadosAtuais = obterDadosUrl(tab.url);
+  console.log(`Monitorando: ${dadosAtuais.hostname}`);
+}
+
+async function registrarTroca(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+
+    if (!tab.active) {
+      return;
+    }
+
+    if (!tab.url || tab.url.startsWith("chrome://")) {
+      await encerrarSessao();
+      return;
+    }
+
+    await encerrarSessao();
+    await iniciarSessao(tab);
+  } catch (error) {
+    console.error("Erro ao registrar troca de aba:", error);
+  }
+}
+
+async function registrarInteracao(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.active) {
+    return;
+  }
+
+  const now = Date.now();
+  const lastActivity = currentSession
+    ? new Date(currentSession.lastActivity).getTime()
+    : 0;
+  const timedOut =
+    currentSession &&
+    now - lastActivity >= INACTIVITY_LIMIT_SECONDS * 1000;
+
+  if (timedOut || currentSession?.tabId !== tabId) {
+    await encerrarSessao(now);
+  }
+
+  if (!currentSession) {
+    await iniciarSessao(tab, now);
+    return;
+  }
+
+  currentSession.lastActivity = new Date(now).toISOString();
+  await persistirSessao();
+  await agendarEncerramento();
+}
 
 /**
  * Envia registro para o Supabase
@@ -332,81 +501,73 @@ async function salvarRegistro(registro) {
   }
 }
 
-/**
- * Registra troca de abas
- */
-async function registrarTroca(tabId) {
-  try {
-    const tab = await chrome.tabs.get(tabId);
-
-    if (!tab.url || tab.url.startsWith("chrome://")) {
-      return;
-    }
-
-    const agora = new Date();
-
-    if (currentTab && startTime) {
-      const duracaoSegundos = Math.floor(
-        (agora.getTime() - new Date(startTime).getTime()) / 1000
-      );
-
-      if (duracaoSegundos >= 5) {
-        const dados = obterDadosUrl(currentTab.url);
-
-        const info = identificarAplicacao(
-          currentTab.url,
-          dados.hostname,
-          currentTab.title
-        );
-
-        const registro = {
-          url: dados.url,
-          hostname: dados.hostname,
-          pathname: dados.pathname,
-          protocolo: dados.protocolo,
-
-          empresa: info.empresa,
-          aplicacao: info.aplicacao,
-          categoria: info.categoria,
-
-          titulo: currentTab.title,
-
-          inicio: startTime,
-          fim: agora.toISOString(),
-
-          duracaoSegundos
-        };
-
-        await salvarRegistro(registro);
-      }
-    }
-
-    currentTab = {
-      url: tab.url,
-      title: tab.title
-    };
-
-    startTime = agora.toISOString();
-
-    const dadosAtuais = obterDadosUrl(tab.url);
-
-    console.log(
-      `Monitorando: ${dadosAtuais.hostname}`
-    );
-
-  } catch (error) {
-    console.error("Erro:", error);
-  }
-}
-
 chrome.tabs.onActivated.addListener((activeInfo) => {
-  registrarTroca(activeInfo.tabId);
+  void serializarOperacao(() => registrarTroca(activeInfo.tabId));
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "complete") {
-    registrarTroca(tabId);
+    void serializarOperacao(() => registrarTroca(tabId));
   }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void serializarOperacao(async () => {
+    if (currentSession?.tabId === tabId) {
+      await encerrarSessao();
+    }
+  });
+});
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type !== "PORTAL_USER_ACTIVITY" || !sender.tab?.id) {
+    return;
+  }
+
+  void serializarOperacao(() => registrarInteracao(sender.tab.id));
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== INACTIVITY_ALARM) {
+    return;
+  }
+
+  void serializarOperacao(async () => {
+    if (!currentSession) {
+      return;
+    }
+
+    const deadline =
+      new Date(currentSession.lastActivity).getTime() +
+      INACTIVITY_LIMIT_SECONDS * 1000;
+
+    if (Date.now() < deadline) {
+      await agendarEncerramento();
+      return;
+    }
+
+    await encerrarSessao(deadline);
+  });
+});
+
+chrome.idle.setDetectionInterval(INACTIVITY_LIMIT_SECONDS);
+chrome.idle.onStateChanged.addListener((state) => {
+  if (state !== "idle" && state !== "locked") {
+    return;
+  }
+
+  void serializarOperacao(() => encerrarSessao());
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void serializarOperacao(async () => {
+    if (!currentSession) {
+      return;
+    }
+
+    // Do not count time while the browser was closed.
+    await encerrarSessao(new Date(currentSession.lastActivity).getTime());
+  });
 });
 
 chrome.runtime.onMessage.addListener(

@@ -6,7 +6,9 @@
 
   "permissions": [
     "tabs",
-    "storage"
+    "storage",
+    "alarms",
+    "idle"
   ],
 
   "host_permissions": [
@@ -22,6 +24,15 @@
       ],
       "js": [
         "content-portal-identity.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content-activity.js"
       ],
       "run_at": "document_start"
     }
