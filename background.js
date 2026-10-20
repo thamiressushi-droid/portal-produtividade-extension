@@ -86,12 +86,13 @@ async function agendarEncerramento() {
   });
 }
 
-async function encerrarSessao(endTime = Date.now()) {
+async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
   if (!currentSession) {
     return;
   }
 
   const sessao = currentSession;
+  const dados = obterDadosUrl(sessao.url);
   const lastActivity = new Date(sessao.lastActivity).getTime();
   const fim = Math.min(
     endTime,
@@ -99,6 +100,19 @@ async function encerrarSessao(endTime = Date.now()) {
   );
   const duracaoSegundos = Math.floor(
     (fim - new Date(sessao.inicio).getTime()) / 1000
+  );
+
+  console.info(
+    "[Portal Extensão][background] Sessão encerrada",
+    {
+      domain: dados.hostname,
+      timestamp: new Date().toISOString(),
+      inicio: sessao.inicio,
+      lastActivity: sessao.lastActivity,
+      fim: new Date(fim).toISOString(),
+      duracaoSegundos,
+      reason
+    }
   );
 
   currentSession = null;
@@ -109,7 +123,6 @@ async function encerrarSessao(endTime = Date.now()) {
     return;
   }
 
-  const dados = obterDadosUrl(sessao.url);
   const info = identificarAplicacao(
     sessao.url,
     dados.hostname,
@@ -150,7 +163,15 @@ async function iniciarSessao(tab, startTime = Date.now()) {
   await agendarEncerramento();
 
   const dadosAtuais = obterDadosUrl(tab.url);
-  console.log(`Monitorando: ${dadosAtuais.hostname}`);
+  console.info(
+    "[Portal Extensão][background] Nova sessão criada",
+    {
+      domain: dadosAtuais.hostname,
+      timestamp,
+      tabId: tab.id,
+      url: tab.url
+    }
+  );
 }
 
 async function registrarTroca(tabId) {
@@ -162,18 +183,18 @@ async function registrarTroca(tabId) {
     }
 
     if (!tab.url || tab.url.startsWith("chrome://")) {
-      await encerrarSessao();
+      await encerrarSessao(Date.now(), "tab_change");
       return;
     }
 
-    await encerrarSessao();
+    await encerrarSessao(Date.now(), "tab_change");
     await iniciarSessao(tab);
   } catch (error) {
     console.error("Erro ao registrar troca de aba:", error);
   }
 }
 
-async function registrarInteracao(tabId) {
+async function registrarInteracao(tabId, interaction = "unknown") {
   const tab = await chrome.tabs.get(tabId);
   if (!tab.active) {
     return;
@@ -187,8 +208,10 @@ async function registrarInteracao(tabId) {
     currentSession &&
     now - lastActivity >= INACTIVITY_LIMIT_SECONDS * 1000;
 
-  if (timedOut || currentSession?.tabId !== tabId) {
-    await encerrarSessao(now);
+  if (timedOut) {
+    await encerrarSessao(now, "inactivity");
+  } else if (currentSession?.tabId !== tabId) {
+    await encerrarSessao(now, "tab_change");
   }
 
   if (!currentSession) {
@@ -196,7 +219,18 @@ async function registrarInteracao(tabId) {
     return;
   }
 
+  const previousLastActivity = currentSession.lastActivity;
   currentSession.lastActivity = new Date(now).toISOString();
+  console.info(
+    "[Portal Extensão][background] Timestamp de atividade atualizado",
+    {
+      domain: obterDadosUrl(currentSession.url).hostname,
+      timestamp: currentSession.lastActivity,
+      previousLastActivity,
+      tabId,
+      interaction
+    }
+  );
   await persistirSessao();
   await agendarEncerramento();
 }
@@ -514,7 +548,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   void serializarOperacao(async () => {
     if (currentSession?.tabId === tabId) {
-      await encerrarSessao();
+      await encerrarSessao(Date.now(), "tab_closed");
     }
   });
 });
@@ -524,7 +558,20 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     return;
   }
 
-  void serializarOperacao(() => registrarInteracao(sender.tab.id));
+  console.info(
+    "[Portal Extensão][background] PORTAL_USER_ACTIVITY recebida",
+    {
+      domain: obterDadosUrl(sender.tab.url || message.hostname || "").hostname,
+      timestamp: new Date().toISOString(),
+      activityTimestamp: message.timestamp || null,
+      interaction: message.interaction || "unknown",
+      tabId: sender.tab.id
+    }
+  );
+
+  void serializarOperacao(() =>
+    registrarInteracao(sender.tab.id, message.interaction)
+  );
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -546,7 +593,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       return;
     }
 
-    await encerrarSessao(deadline);
+    await encerrarSessao(deadline, "inactivity");
   });
 });
 
@@ -556,7 +603,7 @@ chrome.idle.onStateChanged.addListener((state) => {
     return;
   }
 
-  void serializarOperacao(() => encerrarSessao());
+  void serializarOperacao(() => encerrarSessao(Date.now(), "browser_idle"));
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -566,7 +613,10 @@ chrome.runtime.onStartup.addListener(() => {
     }
 
     // Do not count time while the browser was closed.
-    await encerrarSessao(new Date(currentSession.lastActivity).getTime());
+    await encerrarSessao(
+      new Date(currentSession.lastActivity).getTime(),
+      "browser_startup"
+    );
   });
 });
 
