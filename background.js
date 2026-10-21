@@ -38,7 +38,13 @@ let sessionOperation = Promise.resolve();
 const sessionReady = chrome.storage.local
   .get("activeSession")
   .then(async ({ activeSession }) => {
-    currentSession = activeSession || null;
+    currentSession = activeSession
+      ? {
+          ...activeSession,
+          intervalStart: activeSession.intervalStart || activeSession.inicio,
+          isActive: activeSession.isActive !== false
+        }
+      : null;
 
     if (currentSession) {
       await agendarEncerramento();
@@ -72,7 +78,7 @@ async function persistirSessao() {
 }
 
 async function agendarEncerramento() {
-  if (!currentSession) {
+  if (!currentSession || !currentSession.isActive) {
     await chrome.alarms.clear(INACTIVITY_ALARM);
     return;
   }
@@ -91,58 +97,63 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     return;
   }
 
+  const inactivityDeadline =
+    new Date(currentSession.lastActivity).getTime() +
+    INACTIVITY_LIMIT_SECONDS * 1000;
+
+  if (currentSession.isActive && endTime >= inactivityDeadline) {
+    await registrarInatividade(inactivityDeadline);
+  }
+
   const sessao = currentSession;
+  const inicioIntervalo = new Date(
+    sessao.intervalStart || sessao.inicio
+  ).getTime();
+  const fim = Math.max(inicioIntervalo, endTime);
+  const duracaoSegundos = Math.floor((fim - inicioIntervalo) / 1000);
   const dados = obterDadosUrl(sessao.url);
-  const lastActivity = new Date(sessao.lastActivity).getTime();
-  const fim = Math.min(
-    endTime,
-    lastActivity + INACTIVITY_LIMIT_SECONDS * 1000
-  );
-  const duracaoSegundos = Math.floor(
-    (fim - new Date(sessao.inicio).getTime()) / 1000
-  );
 
   console.info(
     "[Portal Extensão][background] Sessão encerrada",
     {
       domain: dados.hostname,
       timestamp: new Date().toISOString(),
-      inicio: sessao.inicio,
+      inicio: new Date(inicioIntervalo).toISOString(),
       lastActivity: sessao.lastActivity,
       fim: new Date(fim).toISOString(),
       duracaoSegundos,
+      isActive: sessao.isActive,
       reason
     }
   );
 
+  if (duracaoSegundos >= 5) {
+    const info = identificarAplicacao(
+      sessao.url,
+      dados.hostname,
+      sessao.titulo
+    );
+    const registro = {
+      url: dados.url,
+      hostname: dados.hostname,
+      pathname: dados.pathname,
+      protocolo: dados.protocolo,
+      empresa: info.empresa,
+      aplicacao: info.aplicacao,
+      categoria: info.categoria,
+      titulo: sessao.titulo,
+      inicio: new Date(inicioIntervalo).toISOString(),
+      fim: new Date(fim).toISOString(),
+      duracaoSegundos,
+      is_active: sessao.isActive
+    };
+
+    await salvarRegistro(registro);
+  }
+
   currentSession = null;
   await persistirSessao();
   await chrome.alarms.clear(INACTIVITY_ALARM);
-
-  if (duracaoSegundos < 5) {
-    return;
-  }
-
-  const info = identificarAplicacao(
-    sessao.url,
-    dados.hostname,
-    sessao.titulo
-  );
-  const registro = {
-    url: dados.url,
-    hostname: dados.hostname,
-    pathname: dados.pathname,
-    protocolo: dados.protocolo,
-    empresa: info.empresa,
-    aplicacao: info.aplicacao,
-    categoria: info.categoria,
-    titulo: sessao.titulo,
-    inicio: sessao.inicio,
-    fim: new Date(fim).toISOString(),
-    duracaoSegundos
-  };
-
-  void salvarRegistro(registro);
 }
 
 async function iniciarSessao(tab, startTime = Date.now()) {
@@ -156,7 +167,9 @@ async function iniciarSessao(tab, startTime = Date.now()) {
     url: tab.url,
     titulo: tab.title || "",
     inicio: timestamp,
-    lastActivity: timestamp
+    lastActivity: timestamp,
+    intervalStart: timestamp,
+    isActive: true
   };
 
   await persistirSessao();
@@ -201,22 +214,35 @@ async function registrarInteracao(tabId, interaction = "unknown") {
   }
 
   const now = Date.now();
-  const lastActivity = currentSession
-    ? new Date(currentSession.lastActivity).getTime()
-    : 0;
-  const timedOut =
-    currentSession &&
-    now - lastActivity >= INACTIVITY_LIMIT_SECONDS * 1000;
 
-  if (timedOut) {
-    await encerrarSessao(now, "inactivity");
-  } else if (currentSession?.tabId !== tabId) {
+  if (currentSession?.tabId !== tabId) {
     await encerrarSessao(now, "tab_change");
   }
 
   if (!currentSession) {
     await iniciarSessao(tab, now);
     return;
+  }
+
+  if (currentSession.isActive) {
+    const inactivityDeadline =
+      new Date(currentSession.lastActivity).getTime() +
+      INACTIVITY_LIMIT_SECONDS * 1000;
+
+    if (now >= inactivityDeadline) {
+      await registrarInatividade(inactivityDeadline);
+    }
+  }
+
+  if (!currentSession.isActive) {
+    await salvarIntervalo(
+      currentSession,
+      currentSession.intervalStart,
+      now,
+      false
+    );
+    currentSession.intervalStart = new Date(now).toISOString();
+    currentSession.isActive = true;
   }
 
   const previousLastActivity = currentSession.lastActivity;
@@ -233,6 +259,74 @@ async function registrarInteracao(tabId, interaction = "unknown") {
   );
   await persistirSessao();
   await agendarEncerramento();
+}
+
+async function registrarInatividade(timestamp = Date.now()) {
+  if (!currentSession || !currentSession.isActive) {
+    return;
+  }
+
+  const inactivityDeadline =
+    new Date(currentSession.lastActivity).getTime() +
+    INACTIVITY_LIMIT_SECONDS * 1000;
+
+  if (timestamp < inactivityDeadline) {
+    await agendarEncerramento();
+    return;
+  }
+
+  const inicioIntervalo = currentSession.intervalStart || currentSession.inicio;
+  await salvarIntervalo(
+    currentSession,
+    inicioIntervalo,
+    inactivityDeadline,
+    true
+  );
+  currentSession.intervalStart = new Date(inactivityDeadline).toISOString();
+  currentSession.isActive = false;
+  await persistirSessao();
+  await chrome.alarms.clear(INACTIVITY_ALARM);
+
+  console.info(
+    "[Portal Extensão][background] Inatividade detectada após 5 minutos",
+    {
+      timestamp: new Date(inactivityDeadline).toISOString(),
+      tabId: currentSession.tabId
+    }
+  );
+}
+
+async function salvarIntervalo(sessao, inicio, fim, isActive) {
+  const inicioMs = new Date(inicio).getTime();
+  const fimMs = Math.max(inicioMs, new Date(fim).getTime());
+  const duracaoSegundos = Math.floor((fimMs - inicioMs) / 1000);
+
+  if (duracaoSegundos < 5) {
+    return;
+  }
+
+  const dados = obterDadosUrl(sessao.url);
+  const info = identificarAplicacao(
+    sessao.url,
+    dados.hostname,
+    sessao.titulo
+  );
+  const registro = {
+    url: dados.url,
+    hostname: dados.hostname,
+    pathname: dados.pathname,
+    protocolo: dados.protocolo,
+    empresa: info.empresa,
+    aplicacao: info.aplicacao,
+    categoria: info.categoria,
+    titulo: sessao.titulo,
+    inicio: new Date(inicioMs).toISOString(),
+    fim: new Date(fimMs).toISOString(),
+    duracaoSegundos,
+    is_active: isActive
+  };
+
+  await salvarRegistro(registro);
 }
 
 /**
@@ -256,7 +350,7 @@ async function enviarParaSupabase(registro) {
           domain: registro.hostname,
           started_at: registro.inicio,
           ended_at: registro.fim,
-          is_active: false,
+          is_active: registro.is_active,
           source: "chrome-extension"
         })
       }
