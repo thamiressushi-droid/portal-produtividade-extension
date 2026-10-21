@@ -39,10 +39,21 @@ console.log("🔥🔥🔥 VERSAO NOVA DA EXTENSAO 🔥🔥🔥");
       return;
     }
 
-    console.info("[Portal Extensão][content] Encaminhando identidade ao background", {
-      hasUserId: typeof data.userId === "string",
-      userIdIsNull: data.userId === null
-    });
+    const userId =
+      typeof data.userId === "string" ? data.userId.trim() : data.userId;
+
+    if (userId !== null && (typeof userId !== "string" || !userId)) {
+      console.error(
+        "[Portal Extensão][content] Identidade ignorada: userId ausente ou inválido",
+        { receivedType: typeof data.userId }
+      );
+      return;
+    }
+
+    console.info(
+      "[Portal Extensão][content] Encaminhando identidade ao background",
+      { userId }
+    );
 
     try {
       console.info(
@@ -51,7 +62,7 @@ console.log("🔥🔥🔥 VERSAO NOVA DA EXTENSAO 🔥🔥🔥");
       chrome.runtime.sendMessage(
         {
           type: backgroundIdentityMessageType,
-          userId: data.userId
+          userId
         },
         (response) => {
           const runtimeError = chrome.runtime.lastError;
@@ -73,7 +84,8 @@ console.log("🔥🔥🔥 VERSAO NOVA DA EXTENSAO 🔥🔥🔥");
           }
 
           console.info(
-            "[Portal Extensão][content] Background confirmou identidade persistida"
+            "[Portal Extensão][content] Background confirmou identidade persistida",
+            { userId }
           );
         }
       );

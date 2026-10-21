@@ -2,31 +2,22 @@ const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
 const SUPABASE_KEY = "sb_publishable_a1G3noc-lXu2NWCBO7k6Yg_xi7-5fBB";
 
 async function obterUserId() {
-  const dados = await chrome.storage.local.get([
-    "portalUserId",
-    "user_id"
-  ]);
+  const { portalUserId } = await chrome.storage.local.get("portalUserId");
+  const userId =
+    typeof portalUserId === "string" ? portalUserId.trim() : "";
 
-  console.log("📦 Storage:", dados);
-
-  if (dados.portalUserId) {
-    console.log(
-      "✅ Usuário recebido do portal:",
-      dados.portalUserId
+  if (!userId) {
+    throw new Error(
+      "Identidade autenticada do portal indisponível; registro não enviado."
     );
-
-    return dados.portalUserId;
   }
 
-  if (dados.user_id) {
-    return dados.user_id;
-  }
-
-  console.warn(
-    "⚠️ Nenhum usuário recebido do portal. Usando UUID temporário."
+  console.info(
+    "[Portal Extensão][background] Identidade selecionada para envio",
+    { userId }
   );
 
-  return "662bb8f3-684f-4a31-a34d-98195f226109";
+  return userId;
 }
 
 const INACTIVITY_LIMIT_SECONDS = 300;
@@ -335,6 +326,16 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
 async function enviarParaSupabase(registro) {
   try {
     const userId = await obterUserId();
+
+    console.info(
+      "[Portal Extensão][background] Enviando web_event",
+      {
+        user_id: userId,
+        domain: registro.hostname,
+        started_at: registro.inicio,
+        ended_at: registro.fim
+      }
+    );
 
     const response = await fetch(
       `${SUPABASE_URL}/rest/v1/web_events`,
@@ -749,28 +750,45 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
+    const userId =
+      typeof message.userId === "string"
+        ? message.userId.trim()
+        : null;
+
+    if (userId === "") {
+      console.error(
+        "[Portal Extensão][background] Identidade rejeitada: userId vazio"
+      );
+      sendResponse({
+        ok: false,
+        stage: "validation"
+      });
+      return;
+    }
+
     console.info(
       "[Portal Extensão][background] Iniciando gravação no chrome.storage.local",
       {
         operation:
-          message.userId === null ? "remove" : "set"
+          userId === null ? "remove" : "set",
+        userId
       }
     );
 
     const operation =
-      message.userId === null
+      userId === null
         ? chrome.storage.local.remove("portalUserId")
         : chrome.storage.local.set({
-            portalUserId: message.userId
+            portalUserId: userId
           });
 
     void operation
       .then(async () => {
         const stored = await chrome.storage.local.get("portalUserId");
         const persisted =
-          message.userId === null
+          userId === null
             ? !Object.hasOwn(stored, "portalUserId")
-            : stored.portalUserId === message.userId;
+            : stored.portalUserId === userId;
 
         if (!persisted) {
           console.error(
@@ -784,7 +802,10 @@ chrome.runtime.onMessage.addListener(
         }
 
         console.info(
-          "[Portal Extensão][background] Identidade persistida e verificada"
+          "[Portal Extensão][background] Identidade persistida e verificada",
+          {
+            userId: userId === null ? null : stored.portalUserId
+          }
         );
         sendResponse({
           ok: true,
