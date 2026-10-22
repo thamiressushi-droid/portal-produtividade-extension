@@ -20,7 +20,7 @@ async function obterUserId() {
   return userId;
 }
 
-const INACTIVITY_LIMIT_SECONDS = 300;
+const INACTIVITY_LIMIT_SECONDS = 120;
 const INACTIVITY_ALARM = "portal-session-inactivity";
 
 let currentSession = null;
@@ -279,7 +279,7 @@ async function registrarInatividade(timestamp = Date.now()) {
   await chrome.alarms.clear(INACTIVITY_ALARM);
 
   console.info(
-    "[Portal Extensão][background] Inatividade detectada após 5 minutos",
+    "[Portal Extensão][background] Inatividade detectada após 2 minutos",
     {
       timestamp: new Date(inactivityDeadline).toISOString(),
       tabId: currentSession.tabId
