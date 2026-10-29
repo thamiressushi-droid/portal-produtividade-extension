@@ -1,15 +1,65 @@
 const SUPABASE_URL = "https://lqiftfrbdtqcrfxcthao.supabase.co";
 const SUPABASE_KEY = "sb_publishable_a1G3noc-lXu2NWCBO7k6Yg_xi7-5fBB";
+const PORTAL_URL_PATTERNS = [
+  "https://*.app.github.dev/*",
+  "https://portal-produtividade.gehaka.workers.dev/*"
+];
+const PORTAL_IDENTITY_REQUEST = "PORTAL_GET_AUTHENTICATED_USER";
+
+function ehOrigemPortal(sender) {
+  try {
+    const senderUrl = sender?.tab?.url || sender?.url;
+    const hostname = new URL(senderUrl).hostname;
+    return (
+      hostname.endsWith(".app.github.dev") ||
+      hostname === "portal-produtividade.gehaka.workers.dev"
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function consultarIdentidadePortal() {
+  const portalTabs = await chrome.tabs.query({ url: PORTAL_URL_PATTERNS });
+
+  for (const tab of portalTabs) {
+    if (typeof tab.id !== "number") {
+      continue;
+    }
+
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: PORTAL_IDENTITY_REQUEST
+      });
+      const userId =
+        typeof response?.userId === "string" ? response.userId.trim() : "";
+
+      if (userId) {
+        await chrome.storage.local.set({ portalUserId: userId });
+        return userId;
+      }
+    } catch (error) {
+      console.info(
+        "[Portal Extensão][background] Aba do portal ainda não respondeu à consulta de identidade",
+        { tabId: tab.id, error: error.message }
+      );
+    }
+  }
+
+  return "";
+}
 
 async function obterUserId() {
   const { portalUserId } = await chrome.storage.local.get("portalUserId");
-  const userId =
+  let userId =
     typeof portalUserId === "string" ? portalUserId.trim() : "";
 
   if (!userId) {
-    throw new Error(
-      "Identidade autenticada do portal indisponível; registro não enviado."
-    );
+    userId = await consultarIdentidadePortal();
+  }
+
+  if (!userId) {
+    throw new Error("Usuário autenticado do portal não encontrado.");
   }
 
   console.info(
@@ -424,6 +474,7 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
   const userId = await obterUserId();
   const startedAtIso = new Date(startedAt).toISOString();
   const endedAtIso = endedAt ? new Date(endedAt).toISOString() : null;
+  const createdAtIso = new Date().toISOString();
   const durationSeconds = endedAtIso
     ? Math.max(
         0,
@@ -445,11 +496,11 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
       },
       body: JSON.stringify({
         user_id: userId,
-        domain: obterDadosUrl(sessao.url).hostname,
         started_at: startedAtIso,
         ended_at: endedAtIso,
         duration_seconds: durationSeconds,
-        source: "chrome-extension"
+        classification: "inactive",
+        created_at: createdAtIso
       })
     }
   );
@@ -507,16 +558,38 @@ async function finalizarEventoInatividade(endedAt) {
   await persistirSessao();
 
   try {
-    if (currentSession.inactivityEventId) {
-      const userId = await obterUserId();
+    const userId = await obterUserId();
+    let eventId = currentSession.inactivityEventId;
+
+    if (!eventId) {
+      const lookupResponse = await fetch(
+        `${SUPABASE_URL}/rest/v1/inactivity_events?user_id=eq.${encodeURIComponent(userId)}&started_at=eq.${encodeURIComponent(new Date(startedAt).toISOString())}&ended_at=is.null&select=id&order=created_at.desc&limit=1`,
+        {
+          headers: {
+            "apikey": SUPABASE_KEY
+          }
+        }
+      );
+
+      if (!lookupResponse.ok) {
+        throw new Error(
+          `Busca de inactivity_event aberto falhou: ${lookupResponse.status} ${await lookupResponse.text()}`
+        );
+      }
+
+      const openEvents = await lookupResponse.json();
+      eventId = openEvents?.[0]?.id ?? null;
+    }
+
+    if (eventId) {
       const response = await fetch(
-        `${SUPABASE_URL}/rest/v1/inactivity_events?id=eq.${encodeURIComponent(currentSession.inactivityEventId)}&user_id=eq.${encodeURIComponent(userId)}`,
+        `${SUPABASE_URL}/rest/v1/inactivity_events?id=eq.${encodeURIComponent(eventId)}&user_id=eq.${encodeURIComponent(userId)}&ended_at=is.null`,
         {
           method: "PATCH",
           headers: {
             "apikey": SUPABASE_KEY,
             "Content-Type": "application/json",
-            "Prefer": "return=minimal"
+            "Prefer": "return=representation"
           },
           body: JSON.stringify({
             ended_at: endedAtIso,
@@ -529,6 +602,11 @@ async function finalizarEventoInatividade(endedAt) {
         throw new Error(
           `Finalização de inactivity_event falhou: ${response.status} ${await response.text()}`
         );
+      }
+
+      const updatedEvents = await response.json();
+      if (!updatedEvents?.length) {
+        throw new Error("Nenhum inactivity_event aberto foi atualizado.");
       }
     } else {
       currentSession.inactivityEventId = await enviarEventoInatividade(
@@ -984,10 +1062,7 @@ chrome.idle.onStateChanged.addListener((state) => {
       return;
     }
 
-    const deadline =
-      new Date(currentSession.lastActivity).getTime() +
-      inactivityThresholdSeconds * 1000;
-    await registrarInatividade(deadline);
+    await registrarInatividade(Date.now());
   });
 });
 
@@ -1011,6 +1086,18 @@ chrome.runtime.onMessage.addListener(
       message?.type !==
       "PORTAL_IDENTITY_CHANGED"
     ) {
+      return;
+    }
+
+    if (!ehOrigemPortal(sender)) {
+      console.error(
+        "[Portal Extensão][background] Identidade rejeitada: origem não autorizada",
+        { senderUrl: sender?.tab?.url || sender?.url }
+      );
+      sendResponse({
+        ok: false,
+        stage: "origin"
+      });
       return;
     }
 

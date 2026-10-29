@@ -1,7 +1,81 @@
 (() => {
-console.log("🔥🔥🔥 VERSAO NOVA DA EXTENSAO 🔥🔥🔥");
   const pageIdentityMessageType = "identity";
   const backgroundIdentityMessageType = "PORTAL_IDENTITY_CHANGED";
+  const backgroundIdentityRequestType = "PORTAL_GET_AUTHENTICATED_USER";
+  const supabaseAuthStorageKey = "sb-lqiftfrbdtqcrfxcthao-auth-token";
+  let lastReportedUserId;
+
+  function getAuthUserId() {
+    try {
+      let serializedSession = window.localStorage.getItem(
+        supabaseAuthStorageKey
+      );
+
+      if (!serializedSession) {
+        return null;
+      }
+
+      if (serializedSession.startsWith("base64-")) {
+        const binary = atob(serializedSession.slice(7));
+        const bytes = Uint8Array.from(binary, (character) =>
+          character.charCodeAt(0)
+        );
+        serializedSession = new TextDecoder().decode(bytes);
+      }
+
+      const session = JSON.parse(serializedSession);
+      const userId =
+        session?.user?.id ||
+        session?.session?.user?.id ||
+        session?.currentSession?.user?.id ||
+        session?.data?.user?.id ||
+        session?.data?.session?.user?.id;
+
+      return typeof userId === "string" && userId.trim()
+        ? userId.trim()
+        : null;
+    } catch (error) {
+      console.warn(
+        "[Portal Extensão][content] Não foi possível ler user.id da sessão Supabase",
+        error
+      );
+      return null;
+    }
+  }
+
+  function notifyBackground(userId) {
+    if (userId === lastReportedUserId) {
+      return;
+    }
+
+    lastReportedUserId = userId;
+    chrome.runtime.sendMessage(
+      {
+        type: backgroundIdentityMessageType,
+        userId
+      },
+      (response) => {
+        const runtimeError = chrome.runtime.lastError;
+
+        if (runtimeError) {
+          lastReportedUserId = undefined;
+          console.error(
+            "[Portal Extensão][content] Falha ao persistir identidade",
+            runtimeError.message
+          );
+          return;
+        }
+
+        if (!response?.ok) {
+          lastReportedUserId = undefined;
+          console.error(
+            "[Portal Extensão][content] Background não confirmou a identidade",
+            response
+          );
+        }
+      }
+    );
+  }
 
   console.info("[Portal Extensão][content] Bridge carregado", {
     pageUrl: window.location.href,
@@ -39,61 +113,65 @@ console.log("🔥🔥🔥 VERSAO NOVA DA EXTENSAO 🔥🔥🔥");
       return;
     }
 
-    const userId =
-      typeof data.userId === "string" ? data.userId.trim() : data.userId;
+    const userId = Object.hasOwn(data, "userId")
+      ? data.userId
+      : data.user?.id ?? data.session?.user?.id;
 
-    if (userId !== null && (typeof userId !== "string" || !userId)) {
+    if (userId === undefined) {
       console.error(
-        "[Portal Extensão][content] Identidade ignorada: userId ausente ou inválido",
-        { receivedType: typeof data.userId }
+        "[Portal Extensão][content] Identidade ignorada: userId ausente"
       );
       return;
     }
 
-    console.info(
-      "[Portal Extensão][content] Encaminhando identidade ao background",
-      { userId }
-    );
+    if (userId === null) {
+      notifyBackground(null);
+      return;
+    }
 
-    try {
-      console.info(
-        "[Portal Extensão][content] Chamando chrome.runtime.sendMessage"
-      );
-      chrome.runtime.sendMessage(
-        {
-          type: backgroundIdentityMessageType,
-          userId
-        },
-        (response) => {
-          const runtimeError = chrome.runtime.lastError;
-
-          if (runtimeError) {
-            console.error(
-              "[Portal Extensão][content] Falha em chrome.runtime.sendMessage",
-              runtimeError.message
-            );
-            return;
-          }
-
-          if (!response?.ok) {
-            console.error(
-              "[Portal Extensão][content] Background não confirmou a persistência",
-              response
-            );
-            return;
-          }
-
-          console.info(
-            "[Portal Extensão][content] Background confirmou identidade persistida",
-            { userId }
-          );
-        }
-      );
-    } catch (error) {
+    if (typeof userId !== "string" || !userId.trim()) {
       console.error(
-        "[Portal Extensão][content] Erro síncrono em chrome.runtime.sendMessage",
-        error
+        "[Portal Extensão][content] Identidade ignorada: userId inválido",
+        { receivedType: typeof userId }
       );
+      return;
+    }
+
+    notifyBackground(userId.trim());
+  });
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type !== backgroundIdentityRequestType) {
+      return;
+    }
+
+    const userId = getAuthUserId();
+    if (userId) {
+      notifyBackground(userId);
+    }
+    sendResponse({ userId });
+  });
+
+  function refreshAuthIdentity(clearIfMissing = false) {
+    const userId = getAuthUserId();
+    if (userId) {
+      notifyBackground(userId);
+    } else if (clearIfMissing) {
+      notifyBackground(null);
+    }
+  }
+
+  refreshAuthIdentity();
+  window.addEventListener("storage", (event) => {
+    if (event.key === supabaseAuthStorageKey) {
+      refreshAuthIdentity(event.newValue === null);
+    }
+  });
+  window.addEventListener("focus", () => refreshAuthIdentity(true));
+  window.addEventListener("pageshow", () => refreshAuthIdentity(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      refreshAuthIdentity(true);
     }
   });
 })();
