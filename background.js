@@ -20,15 +20,97 @@ async function obterUserId() {
   return userId;
 }
 
-const INACTIVITY_LIMIT_SECONDS = 120;
+const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
+const INACTIVITY_SETTINGS_REFRESH_ALARM = "portal-inactivity-settings-refresh";
 const INACTIVITY_ALARM = "portal-session-inactivity";
 
 let currentSession = null;
+let inactivityThresholdSeconds = null;
 let sessionOperation = Promise.resolve();
 
+function converterLimiteInatividade(value) {
+  const minutes = Number(value);
+
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return null;
+  }
+
+  return Math.ceil(minutes * 60);
+}
+
+async function aplicarLimiteInatividade(minutes) {
+  const thresholdSeconds = converterLimiteInatividade(minutes);
+
+  if (thresholdSeconds === null) {
+    return false;
+  }
+
+  inactivityThresholdSeconds = thresholdSeconds;
+  await chrome.storage.local.set({
+    inactivityThresholdMinutes: Number(minutes)
+  });
+  await chrome.idle.setDetectionInterval(Math.max(15, thresholdSeconds));
+
+  if (currentSession?.isActive) {
+    await agendarEncerramento();
+  }
+
+  return true;
+}
+
+async function atualizarLimiteInatividade() {
+  try {
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/settings?key=eq.${encodeURIComponent(INACTIVITY_SETTINGS_KEY)}&select=value&limit=1`,
+      {
+        headers: {
+          "apikey": SUPABASE_KEY
+        }
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Leitura de settings falhou: ${response.status}`);
+    }
+
+    const settings = await response.json();
+    const value = settings?.[0]?.value;
+
+    if (!await aplicarLimiteInatividade(value)) {
+      throw new Error("inactivity_threshold_minutes ausente ou inválido.");
+    }
+
+    console.info(
+      "[Portal Extensão][background] Limite de inatividade atualizado",
+      { minutes: Number(value) }
+    );
+  } catch (error) {
+    if (inactivityThresholdSeconds === null) {
+      const { inactivityThresholdMinutes } = await chrome.storage.local.get(
+        "inactivityThresholdMinutes"
+      );
+      const cachedThreshold = converterLimiteInatividade(
+        inactivityThresholdMinutes
+      );
+
+      if (cachedThreshold !== null) {
+        inactivityThresholdSeconds = cachedThreshold;
+        await chrome.idle.setDetectionInterval(
+          Math.max(15, cachedThreshold)
+        );
+      }
+    }
+
+    console.error(
+      "[Portal Extensão][background] Não foi possível atualizar o limite de inatividade; usando último valor válido",
+      error
+    );
+  }
+}
+
 const sessionReady = chrome.storage.local
-  .get("activeSession")
-  .then(async ({ activeSession }) => {
+  .get(["activeSession", "inactivityThresholdMinutes"])
+  .then(async ({ activeSession, inactivityThresholdMinutes }) => {
     currentSession = activeSession
       ? {
           ...activeSession,
@@ -36,6 +118,26 @@ const sessionReady = chrome.storage.local
           isActive: activeSession.isActive !== false
         }
       : null;
+
+    const cachedThreshold = converterLimiteInatividade(
+      inactivityThresholdMinutes
+    );
+    if (cachedThreshold !== null) {
+      inactivityThresholdSeconds = cachedThreshold;
+      await chrome.idle.setDetectionInterval(
+        Math.max(15, cachedThreshold)
+      );
+    }
+
+    await atualizarLimiteInatividade();
+    const settingsRefreshAlarm = await chrome.alarms.get(
+      INACTIVITY_SETTINGS_REFRESH_ALARM
+    );
+    if (!settingsRefreshAlarm) {
+      await chrome.alarms.create(INACTIVITY_SETTINGS_REFRESH_ALARM, {
+        periodInMinutes: 5
+      });
+    }
 
     if (currentSession) {
       await agendarEncerramento();
@@ -69,14 +171,18 @@ async function persistirSessao() {
 }
 
 async function agendarEncerramento() {
-  if (!currentSession || !currentSession.isActive) {
+  if (
+    !currentSession ||
+    !currentSession.isActive ||
+    inactivityThresholdSeconds === null
+  ) {
     await chrome.alarms.clear(INACTIVITY_ALARM);
     return;
   }
 
   const deadline =
     new Date(currentSession.lastActivity).getTime() +
-    INACTIVITY_LIMIT_SECONDS * 1000;
+    inactivityThresholdSeconds * 1000;
 
   await chrome.alarms.create(INACTIVITY_ALARM, {
     when: deadline
@@ -88,12 +194,14 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     return;
   }
 
-  const inactivityDeadline =
-    new Date(currentSession.lastActivity).getTime() +
-    INACTIVITY_LIMIT_SECONDS * 1000;
+  if (currentSession.isActive && inactivityThresholdSeconds !== null) {
+    const inactivityDeadline =
+      new Date(currentSession.lastActivity).getTime() +
+      inactivityThresholdSeconds * 1000;
 
-  if (currentSession.isActive && endTime >= inactivityDeadline) {
-    await registrarInatividade(inactivityDeadline);
+    if (endTime >= inactivityDeadline) {
+      await registrarInatividade(inactivityDeadline);
+    }
   }
 
   const sessao = currentSession;
@@ -119,11 +227,7 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
   );
 
   if (duracaoSegundos >= 5) {
-    const info = identificarAplicacao(
-      sessao.url,
-      dados.hostname,
-      sessao.titulo
-    );
+    const info = identificarAplicacao(sessao.url, dados.hostname);
     const registro = {
       url: dados.url,
       hostname: dados.hostname,
@@ -133,6 +237,8 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
       aplicacao: info.aplicacao,
       categoria: info.categoria,
       titulo: sessao.titulo,
+      tab_title: sessao.titulo || null,
+      window_title: sessao.windowTitle || null,
       inicio: new Date(inicioIntervalo).toISOString(),
       fim: new Date(fim).toISOString(),
       duracaoSegundos,
@@ -140,6 +246,10 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     };
 
     await salvarRegistro(registro);
+  }
+
+  if (currentSession?.inactivityStartedAt) {
+    await finalizarEventoInatividade(fim);
   }
 
   currentSession = null;
@@ -157,6 +267,7 @@ async function iniciarSessao(tab, startTime = Date.now()) {
     tabId: tab.id,
     url: tab.url,
     titulo: tab.title || "",
+    windowTitle: tab.windowTitle || null,
     inicio: timestamp,
     lastActivity: timestamp,
     intervalStart: timestamp,
@@ -198,7 +309,11 @@ async function registrarTroca(tabId) {
   }
 }
 
-async function registrarInteracao(tabId, interaction = "unknown") {
+async function registrarInteracao(
+  tabId,
+  interaction = "unknown",
+  windowTitle = null
+) {
   const tab = await chrome.tabs.get(tabId);
   if (!tab.active) {
     return;
@@ -211,14 +326,25 @@ async function registrarInteracao(tabId, interaction = "unknown") {
   }
 
   if (!currentSession) {
-    await iniciarSessao(tab, now);
+    await iniciarSessao({ ...tab, windowTitle }, now);
     return;
+  }
+
+  if (currentSession.inactivityEndedAt) {
+    await finalizarEventoInatividade(
+      new Date(currentSession.inactivityEndedAt).getTime()
+    );
+  }
+
+  currentSession.titulo = tab.title || currentSession.titulo || "";
+  if (typeof windowTitle === "string" && windowTitle.trim()) {
+    currentSession.windowTitle = windowTitle;
   }
 
   if (currentSession.isActive) {
     const inactivityDeadline =
       new Date(currentSession.lastActivity).getTime() +
-      INACTIVITY_LIMIT_SECONDS * 1000;
+      (inactivityThresholdSeconds ?? Infinity) * 1000;
 
     if (now >= inactivityDeadline) {
       await registrarInatividade(inactivityDeadline);
@@ -232,6 +358,7 @@ async function registrarInteracao(tabId, interaction = "unknown") {
       now,
       false
     );
+    await finalizarEventoInatividade(now);
     currentSession.intervalStart = new Date(now).toISOString();
     currentSession.isActive = true;
   }
@@ -253,13 +380,17 @@ async function registrarInteracao(tabId, interaction = "unknown") {
 }
 
 async function registrarInatividade(timestamp = Date.now()) {
-  if (!currentSession || !currentSession.isActive) {
+  if (
+    !currentSession ||
+    !currentSession.isActive ||
+    inactivityThresholdSeconds === null
+  ) {
     return;
   }
 
   const inactivityDeadline =
     new Date(currentSession.lastActivity).getTime() +
-    INACTIVITY_LIMIT_SECONDS * 1000;
+    inactivityThresholdSeconds * 1000;
 
   if (timestamp < inactivityDeadline) {
     await agendarEncerramento();
@@ -276,15 +407,149 @@ async function registrarInatividade(timestamp = Date.now()) {
   currentSession.intervalStart = new Date(inactivityDeadline).toISOString();
   currentSession.isActive = false;
   await persistirSessao();
+  await criarEventoInatividade(currentSession.intervalStart);
   await chrome.alarms.clear(INACTIVITY_ALARM);
 
   console.info(
-    "[Portal Extensão][background] Inatividade detectada após 2 minutos",
+    "[Portal Extensão][background] Inatividade detectada",
     {
       timestamp: new Date(inactivityDeadline).toISOString(),
+      thresholdSeconds: inactivityThresholdSeconds,
       tabId: currentSession.tabId
     }
   );
+}
+
+async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
+  const userId = await obterUserId();
+  const startedAtIso = new Date(startedAt).toISOString();
+  const endedAtIso = endedAt ? new Date(endedAt).toISOString() : null;
+  const durationSeconds = endedAtIso
+    ? Math.max(
+        0,
+        Math.floor(
+          (new Date(endedAtIso).getTime() -
+            new Date(startedAtIso).getTime()) /
+            1000
+        )
+      )
+    : null;
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/inactivity_events`,
+    {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        domain: obterDadosUrl(sessao.url).hostname,
+        started_at: startedAtIso,
+        ended_at: endedAtIso,
+        duration_seconds: durationSeconds,
+        source: "chrome-extension"
+      })
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Criação de inactivity_event falhou: ${response.status} ${await response.text()}`
+    );
+  }
+
+  const rows = await response.json();
+  return rows?.[0]?.id ?? null;
+}
+
+async function criarEventoInatividade(startedAt) {
+  if (!currentSession) {
+    return;
+  }
+
+  currentSession.inactivityStartedAt = new Date(startedAt).toISOString();
+  currentSession.inactivityEndedAt = null;
+  currentSession.inactivityEventId = null;
+  await persistirSessao();
+
+  try {
+    currentSession.inactivityEventId = await enviarEventoInatividade(
+      currentSession,
+      currentSession.inactivityStartedAt
+    );
+    await persistirSessao();
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][background] Falha ao criar inactivity_event",
+      error
+    );
+  }
+}
+
+async function finalizarEventoInatividade(endedAt) {
+  if (!currentSession?.inactivityStartedAt) {
+    return true;
+  }
+
+  const startedAt = currentSession.inactivityStartedAt;
+  const endedAtIso = currentSession.inactivityEndedAt ||
+    new Date(endedAt).toISOString();
+  const durationSeconds = Math.max(
+    0,
+    Math.floor(
+      (new Date(endedAtIso).getTime() - new Date(startedAt).getTime()) /
+        1000
+    )
+  );
+  currentSession.inactivityEndedAt = endedAtIso;
+  await persistirSessao();
+
+  try {
+    if (currentSession.inactivityEventId) {
+      const userId = await obterUserId();
+      const response = await fetch(
+        `${SUPABASE_URL}/rest/v1/inactivity_events?id=eq.${encodeURIComponent(currentSession.inactivityEventId)}&user_id=eq.${encodeURIComponent(userId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            "apikey": SUPABASE_KEY,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+          },
+          body: JSON.stringify({
+            ended_at: endedAtIso,
+            duration_seconds: durationSeconds
+          })
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `Finalização de inactivity_event falhou: ${response.status} ${await response.text()}`
+        );
+      }
+    } else {
+      currentSession.inactivityEventId = await enviarEventoInatividade(
+        currentSession,
+        startedAt,
+        endedAtIso
+      );
+    }
+
+    currentSession.inactivityStartedAt = null;
+    currentSession.inactivityEndedAt = null;
+    currentSession.inactivityEventId = null;
+    await persistirSessao();
+    return true;
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][background] Falha ao finalizar inactivity_event",
+      error
+    );
+    return false;
+  }
 }
 
 async function salvarIntervalo(sessao, inicio, fim, isActive) {
@@ -297,11 +562,7 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
   }
 
   const dados = obterDadosUrl(sessao.url);
-  const info = identificarAplicacao(
-    sessao.url,
-    dados.hostname,
-    sessao.titulo
-  );
+  const info = identificarAplicacao(sessao.url, dados.hostname);
   const registro = {
     url: dados.url,
     hostname: dados.hostname,
@@ -311,6 +572,8 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
     aplicacao: info.aplicacao,
     categoria: info.categoria,
     titulo: sessao.titulo,
+    tab_title: sessao.titulo || null,
+    window_title: sessao.windowTitle || null,
     inicio: new Date(inicioMs).toISOString(),
     fim: new Date(fimMs).toISOString(),
     duracaoSegundos,
@@ -352,6 +615,8 @@ async function enviarParaSupabase(registro) {
           started_at: registro.inicio,
           ended_at: registro.fim,
           is_active: registro.is_active,
+          tab_title: registro.tab_title,
+          window_title: registro.window_title,
           source: "chrome-extension"
         })
       }
@@ -385,10 +650,9 @@ async function enviarParaSupabase(registro) {
 /**
  * Identifica aplicação automaticamente
  */
-function identificarAplicacao(url, hostname, titulo = "") {
+function identificarAplicacao(url, hostname) {
   const urlLower = url.toLowerCase();
   const hostLower = hostname.toLowerCase();
-  const tituloLower = titulo.toLowerCase();
 
   if (hostLower.includes("teams")) {
     return {
@@ -565,10 +829,7 @@ function identificarAplicacao(url, hostname, titulo = "") {
     };
   }
 
-  if (
-    hostLower.includes("totvs") ||
-    tituloLower.includes("totvs")
-  ) {
+  if (hostLower.includes("totvs")) {
     return {
       empresa: "TOTVS",
       aplicacao: "TOTVS",
@@ -635,8 +896,17 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "complete") {
-    void serializarOperacao(() => registrarTroca(tabId));
+  if (changeInfo.title || changeInfo.status === "complete") {
+    void serializarOperacao(async () => {
+      if (changeInfo.title && currentSession?.tabId === tabId) {
+        currentSession.titulo = changeInfo.title;
+        await persistirSessao();
+      }
+
+      if (changeInfo.status === "complete") {
+        await registrarTroca(tabId);
+      }
+    });
   }
 });
 
@@ -665,40 +935,60 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   );
 
   void serializarOperacao(() =>
-    registrarInteracao(sender.tab.id, message.interaction)
+    registrarInteracao(
+      sender.tab.id,
+      message.interaction,
+      message.windowTitle
+    )
   );
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === INACTIVITY_SETTINGS_REFRESH_ALARM) {
+    void serializarOperacao(() => atualizarLimiteInatividade());
+    return;
+  }
+
   if (alarm.name !== INACTIVITY_ALARM) {
     return;
   }
 
   void serializarOperacao(async () => {
-    if (!currentSession) {
+    if (!currentSession || inactivityThresholdSeconds === null) {
       return;
     }
 
     const deadline =
       new Date(currentSession.lastActivity).getTime() +
-      INACTIVITY_LIMIT_SECONDS * 1000;
+      inactivityThresholdSeconds * 1000;
 
     if (Date.now() < deadline) {
       await agendarEncerramento();
       return;
     }
 
-    await encerrarSessao(deadline, "inactivity");
+    await registrarInatividade(deadline);
   });
 });
 
-chrome.idle.setDetectionInterval(INACTIVITY_LIMIT_SECONDS);
 chrome.idle.onStateChanged.addListener((state) => {
-  if (state !== "idle" && state !== "locked") {
+  if (
+    (state !== "idle" && state !== "locked") ||
+    inactivityThresholdSeconds === null
+  ) {
     return;
   }
 
-  void serializarOperacao(() => encerrarSessao(Date.now(), "browser_idle"));
+  void serializarOperacao(async () => {
+    if (!currentSession?.isActive) {
+      return;
+    }
+
+    const deadline =
+      new Date(currentSession.lastActivity).getTime() +
+      inactivityThresholdSeconds * 1000;
+    await registrarInatividade(deadline);
+  });
 });
 
 chrome.runtime.onStartup.addListener(() => {

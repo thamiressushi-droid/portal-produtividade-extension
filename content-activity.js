@@ -59,6 +59,7 @@
           type: backgroundMessageType,
           interaction: event.type,
           hostname: location.hostname,
+          windowTitle: document.title || null,
           timestamp: new Date().toISOString(),
         },
         (response) => {
