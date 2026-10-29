@@ -1,7 +1,41 @@
 (() => {
   const backgroundMessageType = "PORTAL_USER_ACTIVITY";
   const minimumIntervalMs = 5000;
+  const knownProtheusScreens = [
+    "Pedidos de Venda",
+    "Orçamentos",
+    "Clientes",
+    "CRM",
+    "Faturamento",
+    "Estoque"
+  ];
   let lastSentAt = 0;
+
+  function readProtheusScreenName() {
+    const hostname = location.hostname.toLowerCase();
+    if (!hostname.includes("totvs") && !hostname.includes("protheus")) {
+      return null;
+    }
+
+    const normalize = (value) =>
+      value
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .trim()
+        .replace(/[:\s]+$/g, "")
+        .toLowerCase();
+
+    const captions = Array.from(
+      document.querySelectorAll("wa-text-view[caption]")
+    )
+      .filter((element) => element.getClientRects().length > 0)
+      .map((element) => element.getAttribute("caption")?.trim())
+      .filter(Boolean);
+
+    return knownProtheusScreens.find((screenName) =>
+      captions.some((caption) => normalize(caption) === normalize(screenName))
+    ) || null;
+  }
 
   function reportActivity(event) {
     console.info(
@@ -43,12 +77,14 @@
     }
 
     lastSentAt = now;
+    const screenName = readProtheusScreenName();
 
     console.info(
       "[Portal Extensão][activity] Enviando atividade para background",
       {
         interaction: event.type,
         hostname: location.hostname,
+        screenName,
         timestamp: new Date().toISOString(),
       }
     );
@@ -60,6 +96,7 @@
           interaction: event.type,
           hostname: location.hostname,
           windowTitle: document.title || null,
+          screenName,
           timestamp: new Date().toISOString(),
         },
         (response) => {

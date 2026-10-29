@@ -88,6 +88,28 @@ function converterLimiteInatividade(value) {
   return Math.ceil(minutes * 60);
 }
 
+function extrairValorConfiguracao(payload) {
+  const candidates = [
+    Array.isArray(payload) ? payload[0] : payload,
+    payload?.data,
+    Array.isArray(payload?.data) ? payload.data[0] : null
+  ];
+  const record = candidates.find(
+    (candidate) =>
+      candidate &&
+      typeof candidate === "object" &&
+      Object.hasOwn(candidate, "value")
+  );
+
+  if (record) {
+    return record.value;
+  }
+
+  return typeof payload === "number" || typeof payload === "string"
+    ? payload
+    : undefined;
+}
+
 async function aplicarLimiteInatividade(minutes) {
   const thresholdSeconds = converterLimiteInatividade(minutes);
 
@@ -123,11 +145,41 @@ async function atualizarLimiteInatividade() {
       throw new Error(`Leitura de settings falhou: ${response.status}`);
     }
 
-    const settings = await response.json();
-    const value = settings?.[0]?.value;
+    const responseBody = await response.text();
+    let settings;
+    try {
+      settings = JSON.parse(responseBody);
+    } catch {
+      throw new Error(
+        `Resposta de settings não é JSON válido: HTTP ${response.status}; corpo=${responseBody}`
+      );
+    }
+
+    const value = extrairValorConfiguracao(settings);
+    console.info(
+      "[Portal Extensão][background] Resposta de inactivity_threshold_minutes",
+      {
+        httpStatus: response.status,
+        contentType: response.headers.get("content-type"),
+        receivedFormat: Array.isArray(settings)
+          ? `array(${settings.length})`
+          : typeof settings,
+        receivedBody: settings,
+        extractedValue: value,
+        extractedType: typeof value
+      }
+    );
+
+    if (value === undefined || value === null || value === "") {
+      throw new Error(
+        `Configuração não retornada. Esperado, por exemplo, [{"value":5}]; recebido: ${JSON.stringify(settings)}.`
+      );
+    }
 
     if (!await aplicarLimiteInatividade(value)) {
-      throw new Error("inactivity_threshold_minutes ausente ou inválido.");
+      throw new Error(
+        `Valor inválido para inactivity_threshold_minutes. Esperado número de minutos (ex.: 5); recebido ${JSON.stringify(value)} (${typeof value}).`
+      );
     }
 
     console.info(
@@ -289,6 +341,7 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
       titulo: sessao.titulo,
       tab_title: sessao.titulo || null,
       window_title: sessao.windowTitle || null,
+      screen_name: sessao.screenName || null,
       inicio: new Date(inicioIntervalo).toISOString(),
       fim: new Date(fim).toISOString(),
       duracaoSegundos,
@@ -362,7 +415,8 @@ async function registrarTroca(tabId) {
 async function registrarInteracao(
   tabId,
   interaction = "unknown",
-  windowTitle = null
+  windowTitle = null,
+  screenName = null
 ) {
   const tab = await chrome.tabs.get(tabId);
   if (!tab.active) {
@@ -376,7 +430,7 @@ async function registrarInteracao(
   }
 
   if (!currentSession) {
-    await iniciarSessao({ ...tab, windowTitle }, now);
+    await iniciarSessao({ ...tab, windowTitle, screenName }, now);
     return;
   }
 
@@ -389,6 +443,9 @@ async function registrarInteracao(
   currentSession.titulo = tab.title || currentSession.titulo || "";
   if (typeof windowTitle === "string" && windowTitle.trim()) {
     currentSession.windowTitle = windowTitle;
+  }
+  if (typeof screenName === "string" && screenName.trim()) {
+    currentSession.screenName = screenName.trim();
   }
 
   if (currentSession.isActive) {
@@ -652,6 +709,7 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
     titulo: sessao.titulo,
     tab_title: sessao.titulo || null,
     window_title: sessao.windowTitle || null,
+    screen_name: sessao.screenName || null,
     inicio: new Date(inicioMs).toISOString(),
     fim: new Date(fimMs).toISOString(),
     duracaoSegundos,
@@ -695,6 +753,7 @@ async function enviarParaSupabase(registro) {
           is_active: registro.is_active,
           tab_title: registro.tab_title,
           window_title: registro.window_title,
+          screen_name: registro.screen_name,
           source: "chrome-extension"
         })
       }
@@ -1016,7 +1075,8 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     registrarInteracao(
       sender.tab.id,
       message.interaction,
-      message.windowTitle
+      message.windowTitle,
+      message.screenName
     )
   );
 });
