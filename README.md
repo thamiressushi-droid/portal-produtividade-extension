@@ -43,3 +43,11 @@ cabeçalho `Authorization: Bearer` e só são feitas quando ele declara a role
 mantida no outbox em vez de usar a role `anon`. A role usada ou o motivo do
 bloqueio aparece nos logs da extensão e no status do popup. As demais chamadas
 Supabase permanecem inalteradas.
+
+As gravações e atualizações de `inactivity_events` também usam o JWT autenticado.
+A migration `20261030193200_reconcile_inactivity_event_permissions.sql`
+concede os privilégios de tabela necessários à role `authenticated`, substitui
+as policies anteriores por regras próprias para `SELECT`, `INSERT` e `UPDATE`,
+e limita o acesso às linhas cujo `user_id` corresponde a `auth.uid()`. A role,
+o método, o `user_id` enviado e a correspondência com o `sub` do JWT aparecem
+nos logs; a role ou o motivo do bloqueio aparece separadamente no popup.

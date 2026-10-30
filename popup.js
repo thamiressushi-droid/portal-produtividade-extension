@@ -40,6 +40,7 @@ function renderizarStatusSincronizacao(status = {}) {
   elemento.textContent = [
     `Eventos pendentes: ${status.pendingCount ?? 0}`,
     `Role usada em web_events: ${status.lastWebEventRole || "Aguardando requisição"}`,
+    `Role usada em inactivity_events: ${status.lastInactivityEventRole || "Aguardando requisição"}`,
     `Último envio com sucesso: ${formatarData(status.lastSuccessAt)}`,
     `Último erro: ${status.lastError || "Nenhum"}`
   ].join("\n");

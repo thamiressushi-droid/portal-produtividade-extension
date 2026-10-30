@@ -605,9 +605,13 @@ async function enviarEventoPendente(event) {
     }
   }
 
-  const isWebEvent = event.endpoint.split("?")[0] === "web_events";
+  const tabelaDestino = event.endpoint.split("?")[0];
+  // web_events e inactivity_events só aceitam escrita da role authenticated
+  // (migrations 0028/0029 revogaram INSERT/UPDATE de anon).
+  const exigeJwt =
+    tabelaDestino === "web_events" || tabelaDestino === "inactivity_events";
   let authorization;
-  if (isWebEvent) {
+  if (exigeJwt) {
     const {
       [PORTAL_USER_ID_STORAGE_KEY]: portalUserId,
       [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: accessToken
@@ -619,7 +623,7 @@ async function enviarEventoPendente(event) {
     if (typeof accessToken !== "string" || !accessToken.trim()) {
       registrarRoleWebEvent("não enviada (JWT ausente)");
       throw new Error(
-        "JWT da sessão do portal indisponível; web_events não será enviada como anon."
+        `JWT da sessão do portal indisponível; ${tabelaDestino} não será enviada como anon.`
       );
     }
 
@@ -635,18 +639,21 @@ async function enviarEventoPendente(event) {
     if (role !== "authenticated") {
       registrarRoleWebEvent(`não enviada (JWT role=${role})`);
       throw new Error(
-        `JWT do portal usa role=${role}; web_events exige role authenticated.`
+        `JWT do portal usa role=${role}; ${tabelaDestino} exige role authenticated.`
       );
     }
 
+    // PATCH (ex.: fechar inactivity_events) não leva user_id no body:
+    // nesse caso valida contra a identidade persistida do portal.
+    const userIdEsperado = body.user_id ?? portalUserId;
     if (
       typeof claims.sub !== "string" ||
-      claims.sub !== body.user_id ||
-      portalUserId !== body.user_id
+      claims.sub !== userIdEsperado ||
+      portalUserId !== userIdEsperado
     ) {
       registrarRoleWebEvent("não enviada (JWT/user_id incompatíveis)");
       throw new Error(
-        "JWT do portal não corresponde ao user_id do evento; web_events não será enviada."
+        `JWT do portal não corresponde ao user_id do evento; ${tabelaDestino} não será enviada.`
       );
     }
 
