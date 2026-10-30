@@ -11,6 +11,26 @@ const OUTBOX_DATABASE_VERSION = 1;
 const OUTBOX_STORE_NAME = "outbox";
 const OUTBOX_SYNC_ALARM = "portal-outbox-sync";
 const SYNC_STATUS_STORAGE_KEY = "syncStatus";
+const INACTIVITY_EVENT_FIELDS = new Set([
+  "user_id",
+  "started_at",
+  "ended_at",
+  "classification",
+  "created_at",
+  "client_event_id"
+]);
+
+function prepararBodyRequisicao(endpoint, body) {
+  if (endpoint.split("?")[0] !== "inactivity_events") {
+    return { ...body };
+  }
+
+  return Object.fromEntries(
+    Object.entries(body).filter(([field]) =>
+      INACTIVITY_EVENT_FIELDS.has(field)
+    )
+  );
+}
 
 function ehOrigemPortal(sender) {
   try {
@@ -365,6 +385,7 @@ async function enfileirarRequisicao({
   method = "POST",
   body
 }) {
+  const requestBody = prepararBodyRequisicao(endpoint, body);
   const database = await abrirOutboxDatabase();
   const transaction = database.transaction(
     OUTBOX_STORE_NAME,
@@ -382,8 +403,8 @@ async function enfileirarRequisicao({
         ...existing,
         endpoint,
         method,
-        body,
-        sortAt: body.started_at || existing.sortAt,
+        body: requestBody,
+        sortAt: requestBody.started_at || existing.sortAt,
         revision: existing.revision + 1,
         attempts: 0,
         nextAttemptAt: 0
@@ -395,9 +416,9 @@ async function enfileirarRequisicao({
       clientEventId,
       endpoint,
       method,
-      body,
+      body: requestBody,
       createdAt: new Date().toISOString(),
-      sortAt: body.started_at || new Date().toISOString(),
+      sortAt: requestBody.started_at || new Date().toISOString(),
       revision: 1,
       attempts: 0,
       nextAttemptAt: 0
@@ -485,7 +506,7 @@ async function registrarFalhaDeEnvio(event, error) {
 }
 
 async function enviarEventoPendente(event) {
-  const body = { ...event.body };
+  const body = prepararBodyRequisicao(event.endpoint, event.body);
   if (event.method === "POST" && !body.user_id) {
     body.user_id = await obterUserId();
     if (!body.user_id) {
@@ -1157,16 +1178,6 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
 
   const startedAtIso = new Date(startedAt).toISOString();
   const endedAtIso = endedAt ? new Date(endedAt).toISOString() : null;
-  const durationSeconds = endedAtIso
-    ? Math.max(
-        0,
-        Math.floor(
-          (new Date(endedAtIso).getTime() -
-            new Date(startedAtIso).getTime()) /
-            1000
-        )
-      )
-    : null;
   await enfileirarRequisicao({
     clientEventId: sessao.inactivityClientEventId,
     endpoint: "inactivity_events?on_conflict=client_event_id",
@@ -1175,7 +1186,6 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
       user_id: sessao.inactivityUserId,
       started_at: startedAtIso,
       ended_at: endedAtIso,
-      duration_seconds: durationSeconds,
       classification: "inactive",
       created_at: startedAtIso
     }
@@ -1211,13 +1221,6 @@ async function finalizarEventoInatividade(endedAt) {
   const startedAt = currentSession.inactivityStartedAt;
   const endedAtIso = currentSession.inactivityEndedAt ||
     new Date(endedAt).toISOString();
-  const durationSeconds = Math.max(
-    0,
-    Math.floor(
-      (new Date(endedAtIso).getTime() - new Date(startedAt).getTime()) /
-        1000
-    )
-  );
   currentSession.inactivityEndedAt = endedAtIso;
   await persistirSessao();
 
@@ -1232,8 +1235,7 @@ async function finalizarEventoInatividade(endedAt) {
       endpoint: `inactivity_events?id=eq.${encodeURIComponent(currentSession.inactivityEventId)}&ended_at=is.null`,
       method: "PATCH",
       body: {
-        ended_at: endedAtIso,
-        duration_seconds: durationSeconds
+        ended_at: endedAtIso
       }
     });
   }
