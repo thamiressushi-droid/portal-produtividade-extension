@@ -4,8 +4,6 @@
   const backgroundIdentityRequestType = "PORTAL_GET_AUTHENTICATED_USER";
   const supabaseAuthStorageKey = "sb-lqiftfrbdtqcrfxcthao-auth-token";
   let lastReportedUserId;
-  let lastObservedUserId;
-  let hasObservedAuthState = false;
 
   function getAuthUserId() {
     try {
@@ -42,7 +40,7 @@
           ? userId.trim()
           : null;
       console.info("[Portal Extensão][content] Leitura da identidade", {
-        found: Boolean(normalizedUserId),
+        userId: normalizedUserId,
         storageKey: supabaseAuthStorageKey
       });
       return normalizedUserId;
@@ -153,8 +151,6 @@
 
     if (typeof userId !== "string" || !userId.trim()) {
       if (userId === null) {
-        lastObservedUserId = null;
-        hasObservedAuthState = true;
         notifyBackground(null);
         return;
       }
@@ -166,9 +162,7 @@
       return;
     }
 
-    lastObservedUserId = userId.trim();
-    hasObservedAuthState = true;
-    notifyBackground(lastObservedUserId);
+    notifyBackground(userId.trim());
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -179,7 +173,7 @@
     const userId = getAuthUserId();
     console.info(
       "[Portal Extensão][content] Identidade consultada pelo background",
-      { available: Boolean(userId) }
+      { userId }
     );
     sendResponse({ userId });
   });
@@ -188,14 +182,7 @@
     const userId = getAuthUserId();
     if (userId) {
       notifyBackground(userId);
-    } else if (hasObservedAuthState && lastObservedUserId) {
-      console.info(
-        "[Portal Extensão][content] Logout detectado pela mudança da identidade"
-      );
-      notifyBackground(null);
     }
-    lastObservedUserId = userId;
-    hasObservedAuthState = true;
   }
 
   refreshAuthIdentity();
@@ -203,11 +190,25 @@
     if (event.key === supabaseAuthStorageKey) {
       if (event.newValue === null) {
         console.info(
-          "[Portal Extensão][content] Remoção da sessão de autenticação detectada"
+          "[Portal Extensão][content] Remoção da sessão detectada; confirmando antes de apagar portalUserId"
         );
-        lastObservedUserId = null;
-        hasObservedAuthState = true;
-        notifyBackground(null);
+        window.setTimeout(() => {
+          const currentUserId = getAuthUserId();
+          if (currentUserId) {
+            console.info(
+              "[Portal Extensão][content] Sessão restaurada; identidade preservada",
+              { userId: currentUserId }
+            );
+            notifyBackground(currentUserId);
+            return;
+          }
+
+          console.info(
+            "[Portal Extensão][content] Logout confirmado pela remoção da sessão",
+            { userId: null }
+          );
+          notifyBackground(null);
+        }, 1_000);
       } else {
         refreshAuthIdentity();
       }

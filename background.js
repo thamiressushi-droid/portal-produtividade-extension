@@ -31,6 +31,7 @@ async function lerUserIdPersistido() {
       typeof portalUserId === "string" ? portalUserId.trim() : "";
 
     console.info("[Portal Extensão][background] Leitura da identidade", {
+      portalUserId: userId || null,
       found: Boolean(userId)
     });
     return userId || null;
@@ -51,6 +52,7 @@ async function persistirIdentidade(userId, source) {
 
   console.info("[Portal Extensão][background] Leitura para persistência", {
     source,
+    portalUserId: currentUserId || null,
     found: Boolean(currentUserId)
   });
 
@@ -63,12 +65,14 @@ async function persistirIdentidade(userId, source) {
 
     console.info("[Portal Extensão][background] Identidade removida", {
       source,
+      portalUserId: null,
       hadIdentity: Boolean(currentUserId)
     });
   } else {
     if (currentUserId === userId) {
       console.info("[Portal Extensão][background] Identidade já persistida", {
         source,
+        portalUserId: currentUserId,
         hasIdentity: true
       });
       return false;
@@ -82,6 +86,7 @@ async function persistirIdentidade(userId, source) {
 
     console.info("[Portal Extensão][background] Identidade gravada", {
       source,
+      portalUserId: userId,
       hasIdentity: true
     });
   }
@@ -93,57 +98,98 @@ async function persistirIdentidade(userId, source) {
   return true;
 }
 
+async function consultarIdentidadePortal() {
+  let portalTabs;
+  try {
+    portalTabs = await chrome.tabs.query({ url: PORTAL_URL_PATTERNS });
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][background] Falha ao consultar abas do portal",
+      error
+    );
+    throw error;
+  }
+  console.info(
+    "[Portal Extensão][background] Resultado da consulta de abas do portal",
+    {
+      tabCount: portalTabs.length,
+      tabs: portalTabs.map(({ id, url }) => ({
+        tabId: id,
+        hostname: (() => {
+          try {
+            return new URL(url).hostname;
+          } catch {
+            return null;
+          }
+        })()
+      }))
+    }
+  );
+
+  for (const tab of portalTabs) {
+    if (typeof tab.id !== "number") {
+      continue;
+    }
+
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: PORTAL_IDENTITY_REQUEST
+      });
+      const userId =
+        typeof response?.userId === "string" ? response.userId.trim() : "";
+      console.info(
+        "[Portal Extensão][background] Resultado da consulta à aba do portal",
+        {
+          tabId: tab.id,
+          receivedResponse: response !== undefined,
+          userId: userId || null
+        }
+      );
+      if (userId) {
+        return userId;
+      }
+    } catch (error) {
+      console.warn(
+        "[Portal Extensão][background] Consulta à aba do portal falhou",
+        {
+          tabId: tab.id,
+          error: error.message || String(error)
+        }
+      );
+    }
+  }
+
+  console.info(
+    "[Portal Extensão][background] Consulta ao portal sem identidade",
+    { userId: null }
+  );
+  return null;
+}
+
 async function obterUserId() {
   try {
     const persistedUserId = await lerUserIdPersistido();
     if (persistedUserId) {
       console.info("[Portal Extensão][background] Resultado de obterUserId()", {
-        available: true,
+        userId: persistedUserId,
         source: "chrome.storage.local"
       });
       return persistedUserId;
     }
 
-    const portalTabs = await chrome.tabs.query({ url: PORTAL_URL_PATTERNS });
-    for (const tab of portalTabs) {
-      if (typeof tab.id !== "number") {
-        continue;
-      }
-
-      let response;
-      try {
-        response = await chrome.tabs.sendMessage(tab.id, {
-          type: PORTAL_IDENTITY_REQUEST
-        });
-      } catch (error) {
-        console.warn(
-          "[Portal Extensão][background] Não foi possível consultar a identidade na aba do portal",
-          { tabId: tab.id, error: error.message || String(error) }
-        );
-        continue;
-      }
-
-      const userId =
-        typeof response?.userId === "string" ? response.userId.trim() : "";
-      if (!userId) {
-        console.info(
-          "[Portal Extensão][background] Consulta à aba do portal sem identidade",
-          { tabId: tab.id }
-        );
-        continue;
-      }
-
+    const userId = await consultarIdentidadePortal();
+    if (userId) {
       await persistirIdentidade(userId, "portal_tab_recovery");
       const recoveredUserId = await lerUserIdPersistido();
       console.info("[Portal Extensão][background] Resultado de obterUserId()", {
-        available: Boolean(recoveredUserId),
+        userId: recoveredUserId,
         source: "portal_tab_recovery"
       });
       return recoveredUserId;
     }
 
     console.warn("[Portal Extensão][background] Resultado de obterUserId()", {
-      available: false,
+      userId: null,
       source: "no_persisted_identity_or_portal_response"
     });
     return null;
@@ -812,7 +858,8 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
       fim: new Date(fim).toISOString(),
       duracaoSegundos,
       isActive: sessao.isActive,
-      reason
+      reason,
+      userId: sessao.userId ?? null
     }
   );
 
@@ -883,7 +930,8 @@ async function iniciarSessao(tab, startTime = Date.now()) {
       domain: dadosAtuais.hostname,
       timestamp,
       tabId: tab.id,
-      url: tab.url
+      url: tab.url,
+      userId: currentSession.userId ?? null
     }
   );
 }
@@ -909,6 +957,22 @@ async function registrarTroca(tabId) {
 }
 
 async function registrarTrocaDeIdentidade(userId) {
+  const sessionUserId = currentSession?.userId ?? null;
+  const hasSession = Boolean(currentSession);
+  console.info(
+    "[Portal Extensão][background] Avaliando troca de identidade da sessão",
+    {
+      requestedUserId: userId,
+      sessionUserId,
+      hasSession,
+      action:
+        !hasSession
+          ? "skip_no_session"
+          : currentSession.userId === userId
+            ? "skip_same_identity"
+            : "restart_session"
+    }
+  );
   if (!currentSession || currentSession.userId === userId) {
     return;
   }
