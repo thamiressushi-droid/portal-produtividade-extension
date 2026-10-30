@@ -34,7 +34,8 @@
         "<all_urls>"
       ],
       "js": [
-        "content-activity.js"
+        "content-activity.js",
+        "content-protheus.js"
       ],
       "run_at": "document_start"
     }

@@ -11,10 +11,12 @@ limite válido fica em cache local para uso temporário se o Supabase estiver
 indisponível. Uma sessão pendente é recuperada sem contabilizar o período em que
 o navegador esteve fechado.
 
-No Protheus/TOTVS, a extensão identifica a rotina pela aba ativa
-(`wa-tab-button[active]`) e o contexto visível pelo atributo `caption` de
-`wa-text-view`, sem uma lista fixa de telas. Esses valores são enviados nos
-campos `screen_name` e `screen_context` de `web_events`. A migração em
+No Protheus/TOTVS, o módulo `content-protheus.js` identifica a rotina pela aba
+ativa (`wa-tab-button[active]`) e o contexto visível pelo atributo `caption` de
+`wa-text-view`, inclusive dentro de shadow roots, sem uma lista fixa de telas.
+Ele envia esses valores para `content-activity.js`, que os inclui nos campos
+`screen_name` e `screen_context` de `web_events`. A captura padrão dos demais
+sites permanece inalterada. A migração em
 `supabase/migrations` adiciona a coluna `screen_context`. Em ferramentas de
 conversa e e-mail reconhecidas (Copilot, ChatGPT, Claude, Gemini, WhatsApp,
 Teams, Outlook, Gmail, Slack e Discord), os títulos são substituídos pelo nome
