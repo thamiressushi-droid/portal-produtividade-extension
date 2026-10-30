@@ -4,6 +4,8 @@
   const backgroundIdentityRequestType = "PORTAL_GET_AUTHENTICATED_USER";
   const supabaseAuthStorageKey = "sb-lqiftfrbdtqcrfxcthao-auth-token";
   let lastReportedUserId;
+  let lastObservedUserId;
+  let hasObservedAuthState = false;
 
   function getAuthUserId() {
     try {
@@ -12,6 +14,10 @@
       );
 
       if (!serializedSession) {
+        console.info("[Portal Extensão][content] Leitura da identidade", {
+          found: false,
+          storageKey: supabaseAuthStorageKey
+        });
         return null;
       }
 
@@ -31,24 +37,41 @@
         session?.data?.user?.id ||
         session?.data?.session?.user?.id;
 
-      return typeof userId === "string" && userId.trim()
-        ? userId.trim()
-        : null;
+      const normalizedUserId =
+        typeof userId === "string" && userId.trim()
+          ? userId.trim()
+          : null;
+      console.info("[Portal Extensão][content] Leitura da identidade", {
+        found: Boolean(normalizedUserId),
+        storageKey: supabaseAuthStorageKey
+      });
+      return normalizedUserId;
     } catch (error) {
       console.warn(
         "[Portal Extensão][content] Não foi possível ler user.id da sessão Supabase",
         error
       );
+      console.info("[Portal Extensão][content] Leitura da identidade", {
+        found: false,
+        storageKey: supabaseAuthStorageKey,
+        failed: true
+      });
       return null;
     }
   }
 
   function notifyBackground(userId) {
-    if (!userId) {
+    if (
+      userId !== null &&
+      (typeof userId !== "string" || !userId.trim())
+    ) {
       return;
     }
 
-    if (userId === lastReportedUserId) {
+    if (
+      lastReportedUserId !== undefined &&
+      userId === lastReportedUserId
+    ) {
       return;
     }
 
@@ -129,6 +152,13 @@
     }
 
     if (typeof userId !== "string" || !userId.trim()) {
+      if (userId === null) {
+        lastObservedUserId = null;
+        hasObservedAuthState = true;
+        notifyBackground(null);
+        return;
+      }
+
       console.error(
         "[Portal Extensão][content] Identidade ignorada: userId inválido",
         { receivedType: typeof userId }
@@ -136,7 +166,9 @@
       return;
     }
 
-    notifyBackground(userId.trim());
+    lastObservedUserId = userId.trim();
+    hasObservedAuthState = true;
+    notifyBackground(lastObservedUserId);
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -145,9 +177,10 @@
     }
 
     const userId = getAuthUserId();
-    if (userId) {
-      notifyBackground(userId);
-    }
+    console.info(
+      "[Portal Extensão][content] Identidade consultada pelo background",
+      { available: Boolean(userId) }
+    );
     sendResponse({ userId });
   });
 
@@ -155,17 +188,34 @@
     const userId = getAuthUserId();
     if (userId) {
       notifyBackground(userId);
+    } else if (hasObservedAuthState && lastObservedUserId) {
+      console.info(
+        "[Portal Extensão][content] Logout detectado pela mudança da identidade"
+      );
+      notifyBackground(null);
     }
+    lastObservedUserId = userId;
+    hasObservedAuthState = true;
   }
 
   refreshAuthIdentity();
   window.addEventListener("storage", (event) => {
     if (event.key === supabaseAuthStorageKey) {
-      refreshAuthIdentity();
+      if (event.newValue === null) {
+        console.info(
+          "[Portal Extensão][content] Remoção da sessão de autenticação detectada"
+        );
+        lastObservedUserId = null;
+        hasObservedAuthState = true;
+        notifyBackground(null);
+      } else {
+        refreshAuthIdentity();
+      }
     }
   });
   window.addEventListener("focus", refreshAuthIdentity);
   window.addEventListener("pageshow", refreshAuthIdentity);
+  window.setInterval(refreshAuthIdentity, 5_000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       refreshAuthIdentity();

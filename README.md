@@ -28,7 +28,10 @@ fila para novas tentativas. O alarme periódico retoma o envio após reiniciar o
 navegador; IDs idempotentes e a migration
 `20261030140000_add_client_event_ids.sql` evitam duplicações no servidor.
 
-A última identidade autenticada permanece em `chrome.storage.local` quando o
-portal está fechado ou não consegue informar uma sessão; eventos já enfileirados
-mantêm a identidade que tinham no momento da captura. O popup mostra a contagem
-de eventos pendentes, o último envio bem-sucedido e o último erro.
+A identidade autenticada é persistida em `chrome.storage.local` e recuperada
+após reiniciar o navegador. Se ela ainda não estiver salva, o background
+consulta as abas abertas do portal; a ausência de uma sessão numa aba não apaga
+uma identidade já persistida. Um logout explícito remove a identidade. Eventos
+já enfileirados mantêm a identidade que tinham no momento da captura. O popup
+mostra a contagem de eventos pendentes, o último envio bem-sucedido e o último
+erro.

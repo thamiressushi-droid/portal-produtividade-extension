@@ -24,11 +24,133 @@ function ehOrigemPortal(sender) {
   }
 }
 
-async function obterUserIdPersistido() {
-  const { portalUserId } = await chrome.storage.local.get("portalUserId");
-  const userId = typeof portalUserId === "string" ? portalUserId.trim() : "";
+async function lerUserIdPersistido() {
+  try {
+    const { portalUserId } = await chrome.storage.local.get("portalUserId");
+    const userId =
+      typeof portalUserId === "string" ? portalUserId.trim() : "";
 
-  return userId || null;
+    console.info("[Portal Extensão][background] Leitura da identidade", {
+      found: Boolean(userId)
+    });
+    return userId || null;
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][background] Falha ao ler identidade persistida",
+      error
+    );
+    throw error;
+  }
+}
+
+async function persistirIdentidade(userId, source) {
+  const identityStorageKey = "portalUserId";
+  const { portalUserId } = await chrome.storage.local.get(identityStorageKey);
+  const currentUserId =
+    typeof portalUserId === "string" ? portalUserId.trim() : "";
+
+  console.info("[Portal Extensão][background] Leitura para persistência", {
+    source,
+    found: Boolean(currentUserId)
+  });
+
+  if (userId === null) {
+    await chrome.storage.local.remove(identityStorageKey);
+    const stored = await chrome.storage.local.get(identityStorageKey);
+    if (stored[identityStorageKey] !== undefined) {
+      throw new Error("Storage não confirmou a remoção da identidade.");
+    }
+
+    console.info("[Portal Extensão][background] Identidade removida", {
+      source,
+      hadIdentity: Boolean(currentUserId)
+    });
+  } else {
+    if (currentUserId === userId) {
+      console.info("[Portal Extensão][background] Identidade já persistida", {
+        source,
+        hasIdentity: true
+      });
+      return false;
+    }
+
+    await chrome.storage.local.set({ [identityStorageKey]: userId });
+    const stored = await chrome.storage.local.get(identityStorageKey);
+    if (stored[identityStorageKey] !== userId) {
+      throw new Error("Storage não confirmou a identidade esperada.");
+    }
+
+    console.info("[Portal Extensão][background] Identidade gravada", {
+      source,
+      hasIdentity: true
+    });
+  }
+
+  void serializarOperacao(() => registrarTrocaDeIdentidade(userId));
+  if (userId !== null) {
+    void sincronizarOutbox();
+  }
+  return true;
+}
+
+async function obterUserId() {
+  try {
+    const persistedUserId = await lerUserIdPersistido();
+    if (persistedUserId) {
+      console.info("[Portal Extensão][background] Resultado de obterUserId()", {
+        available: true,
+        source: "chrome.storage.local"
+      });
+      return persistedUserId;
+    }
+
+    const portalTabs = await chrome.tabs.query({ url: PORTAL_URL_PATTERNS });
+    for (const tab of portalTabs) {
+      if (typeof tab.id !== "number") {
+        continue;
+      }
+
+      let response;
+      try {
+        response = await chrome.tabs.sendMessage(tab.id, {
+          type: PORTAL_IDENTITY_REQUEST
+        });
+      } catch (error) {
+        console.warn(
+          "[Portal Extensão][background] Não foi possível consultar a identidade na aba do portal",
+          { tabId: tab.id, error: error.message || String(error) }
+        );
+        continue;
+      }
+
+      const userId =
+        typeof response?.userId === "string" ? response.userId.trim() : "";
+      if (!userId) {
+        console.info(
+          "[Portal Extensão][background] Consulta à aba do portal sem identidade",
+          { tabId: tab.id }
+        );
+        continue;
+      }
+
+      await persistirIdentidade(userId, "portal_tab_recovery");
+      const recoveredUserId = await lerUserIdPersistido();
+      console.info("[Portal Extensão][background] Resultado de obterUserId()", {
+        available: Boolean(recoveredUserId),
+        source: "portal_tab_recovery"
+      });
+      return recoveredUserId;
+    }
+
+    console.warn("[Portal Extensão][background] Resultado de obterUserId()", {
+      available: false,
+      source: "no_persisted_identity_or_portal_response"
+    });
+    return null;
+  } catch (error) {
+    console.error("[Portal Extensão][background] obterUserId() falhou", error);
+    throw error;
+  }
 }
 
 const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
@@ -293,7 +415,7 @@ async function registrarFalhaDeEnvio(event, error) {
 async function enviarEventoPendente(event) {
   const body = { ...event.body };
   if (event.method === "POST" && !body.user_id) {
-    body.user_id = await obterUserIdPersistido();
+    body.user_id = await obterUserId();
     if (!body.user_id) {
       throw new Error("Identidade indisponível; evento mantido na fila.");
     }
@@ -551,7 +673,7 @@ const sessionReady = chrome.storage.local
 
     if (currentSession) {
       if (!Object.hasOwn(currentSession, "userId")) {
-        currentSession.userId = await obterUserIdPersistido();
+        currentSession.userId = await obterUserId();
       }
       currentSession.titulo = obterTituloSeguro(
         currentSession.url,
@@ -740,7 +862,7 @@ async function iniciarSessao(tab, startTime = Date.now()) {
   currentSession = {
     tabId: tab.id,
     url: tab.url,
-    userId: await obterUserIdPersistido(),
+    userId: await obterUserId(),
     titulo: obterTituloSeguro(tab.url, tab.title) || "",
     windowTitle: obterTituloSeguro(tab.url, tab.windowTitle),
     screenName: obterNomeTelaSeguro(tab.url, tab.screenName),
@@ -929,7 +1051,7 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
     sessao.inactivityClientEventId = criarIdEvento();
   }
   if (!Object.hasOwn(sessao, "inactivityUserId")) {
-    sessao.inactivityUserId = await obterUserIdPersistido();
+    sessao.inactivityUserId = await obterUserId();
   }
 
   const startedAtIso = new Date(startedAt).toISOString();
@@ -970,7 +1092,7 @@ async function criarEventoInatividade(startedAt) {
   currentSession.inactivityEndedAt = null;
   currentSession.inactivityEventId = null;
   currentSession.inactivityClientEventId = criarIdEvento();
-  currentSession.inactivityUserId = await obterUserIdPersistido();
+  currentSession.inactivityUserId = await obterUserId();
   await persistirSessao();
 
   await enviarEventoInatividade(
@@ -1299,7 +1421,7 @@ async function salvarRegistro(registro) {
     endpoint: "web_events?on_conflict=client_event_id",
     body: {
       client_event_id: clientEventId,
-      user_id: registro.user_id ?? await obterUserIdPersistido(),
+      user_id: registro.user_id ?? await obterUserId(),
       domain: registro.hostname,
       started_at: registro.inicio,
       ended_at: registro.fim,
@@ -1516,64 +1638,23 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
-    if (userId === null) {
-      sendResponse({
-        ok: true,
-        stage: "unchanged",
-        userId: null
-      });
-      return;
-    }
-
-    void chrome.storage.local
-      .get("portalUserId")
-      .then(async ({ portalUserId }) => {
-        if (portalUserId === userId) {
-          sendResponse({
-            ok: true,
-            stage: "unchanged"
-          });
-          return;
-        }
-
-        await chrome.storage.local.set({ portalUserId: userId });
-        const stored = await chrome.storage.local.get("portalUserId");
-        const persisted = stored.portalUserId === userId;
-
-        if (!persisted) {
-          console.error(
-            "[Portal Extensão][background] Storage não confirmou o valor esperado"
-          );
-          sendResponse({
-            ok: false,
-            stage: "storage_verification"
-          });
-          return;
-        }
-
-        console.info(
-          "[Portal Extensão][background] Identidade persistida e verificada",
-          {
-            userId: stored.portalUserId
-          }
-        );
-        void sincronizarOutbox();
-        void serializarOperacao(() =>
-          registrarTrocaDeIdentidade(userId)
-        );
+    void persistirIdentidade(userId, "portal_identity_message")
+      .then((changed) => {
         sendResponse({
           ok: true,
-          stage: "storage"
+          stage: changed ? "storage" : "unchanged",
+          ...(userId === null ? { userId: null } : {})
         });
       })
       .catch((error) => {
         console.error(
-          "[Portal Extensão][background] Erro ao verificar ou persistir identidade",
+          "[Portal Extensão][background] Erro ao persistir ou remover identidade",
           error
         );
         sendResponse({
           ok: false,
-          stage: "storage"
+          stage: "storage",
+          error: error.message || String(error)
         });
       });
 
@@ -1586,7 +1667,8 @@ console.info(
   {
     event: "PORTAL_IDENTITY_CHANGED",
     storage: "chrome.storage.local",
-    retainsIdentityWhenUnavailable: true
+    retainsIdentityWhenUnavailable: true,
+    removesIdentityOnExplicitLogout: true
   }
 );
 
