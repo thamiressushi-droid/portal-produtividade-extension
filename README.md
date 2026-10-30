@@ -10,3 +10,12 @@ limite, a extensão registra o intervalo em `web_events` e abre um evento em
 limite válido fica em cache local para uso temporário se o Supabase estiver
 indisponível. Uma sessão pendente é recuperada sem contabilizar o período em que
 o navegador esteve fechado.
+
+No Protheus/TOTVS, a extensão identifica a rotina pela aba ativa
+(`wa-tab-button[active]`) e o contexto visível pelo atributo `caption` de
+`wa-text-view`, sem uma lista fixa de telas. Esses valores são enviados nos
+campos `screen_name` e `screen_context` de `web_events`. A migração em
+`supabase/migrations` adiciona a coluna `screen_context`. Em ferramentas de
+conversa e e-mail reconhecidas (Copilot, ChatGPT, Claude, Gemini, WhatsApp,
+Teams, Outlook, Gmail, Slack e Discord), os títulos são substituídos pelo nome
+do aplicativo e o contexto da tela não é coletado.

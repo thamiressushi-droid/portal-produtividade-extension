@@ -73,10 +73,73 @@ async function obterUserId() {
 const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
 const INACTIVITY_SETTINGS_REFRESH_ALARM = "portal-inactivity-settings-refresh";
 const INACTIVITY_ALARM = "portal-session-inactivity";
+const PRIVATE_APPLICATIONS = [
+  { name: "Copilot", domains: ["copilot.microsoft.com", "copilot.com"] },
+  { name: "ChatGPT", domains: ["chatgpt.com", "chat.openai.com"] },
+  { name: "Claude", domains: ["claude.ai"] },
+  { name: "Gemini", domains: ["gemini.google.com"] },
+  { name: "WhatsApp", domains: ["whatsapp.com"] },
+  { name: "Teams", domains: ["teams.microsoft.com", "teams.live.com"] },
+  {
+    name: "Outlook",
+    domains: [
+      "outlook.com",
+      "outlook.live.com",
+      "outlook.office.com",
+      "outlook.office365.com"
+    ]
+  },
+  { name: "Gmail", domains: ["mail.google.com"] },
+  { name: "Slack", domains: ["slack.com"] },
+  { name: "Discord", domains: ["discord.com"] }
+];
 
 let currentSession = null;
 let inactivityThresholdSeconds = null;
 let sessionOperation = Promise.resolve();
+
+function obterAplicacaoPrivada(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return PRIVATE_APPLICATIONS.find(({ domains }) =>
+      domains.some(
+        (domain) => hostname === domain || hostname.endsWith(`.${domain}`)
+      )
+    )?.name || null;
+  } catch {
+    return null;
+  }
+}
+
+function obterTituloSeguro(url, title) {
+  const privateApplication = obterAplicacaoPrivada(url);
+  if (privateApplication) {
+    return privateApplication;
+  }
+
+  return typeof title === "string" && title.trim() ? title : null;
+}
+
+function obterNomeTelaSeguro(url, screenName) {
+  const privateApplication = obterAplicacaoPrivada(url);
+  if (privateApplication) {
+    return privateApplication;
+  }
+
+  return typeof screenName === "string" && screenName.trim()
+    ? screenName.trim().slice(0, 120)
+    : null;
+}
+
+function obterContextoTelaSeguro(url, screenContext) {
+  if (obterAplicacaoPrivada(url)) {
+    return null;
+  }
+
+  return typeof screenContext === "string" && screenContext.trim()
+    ? screenContext.trim().slice(0, 120)
+    : null;
+}
 
 function converterLimiteInatividade(value) {
   const minutes = Number(value);
@@ -221,6 +284,26 @@ const sessionReady = chrome.storage.local
         }
       : null;
 
+    if (currentSession) {
+      currentSession.titulo = obterTituloSeguro(
+        currentSession.url,
+        currentSession.titulo
+      ) || "";
+      currentSession.windowTitle = obterTituloSeguro(
+        currentSession.url,
+        currentSession.windowTitle
+      );
+      currentSession.screenName = obterNomeTelaSeguro(
+        currentSession.url,
+        currentSession.screenName
+      );
+      currentSession.screenContext = obterContextoTelaSeguro(
+        currentSession.url,
+        currentSession.screenContext
+      );
+      await persistirSessao();
+    }
+
     const cachedThreshold = converterLimiteInatividade(
       inactivityThresholdMinutes
     );
@@ -338,10 +421,14 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
       empresa: info.empresa,
       aplicacao: info.aplicacao,
       categoria: info.categoria,
-      titulo: sessao.titulo,
-      tab_title: sessao.titulo || null,
-      window_title: sessao.windowTitle || null,
-      screen_name: sessao.screenName || null,
+      titulo: obterTituloSeguro(sessao.url, sessao.titulo) || "",
+      tab_title: obterTituloSeguro(sessao.url, sessao.titulo),
+      window_title: obterTituloSeguro(sessao.url, sessao.windowTitle),
+      screen_name: obterNomeTelaSeguro(sessao.url, sessao.screenName),
+      screen_context: obterContextoTelaSeguro(
+        sessao.url,
+        sessao.screenContext
+      ),
       inicio: new Date(inicioIntervalo).toISOString(),
       fim: new Date(fim).toISOString(),
       duracaoSegundos,
@@ -369,8 +456,10 @@ async function iniciarSessao(tab, startTime = Date.now()) {
   currentSession = {
     tabId: tab.id,
     url: tab.url,
-    titulo: tab.title || "",
-    windowTitle: tab.windowTitle || null,
+    titulo: obterTituloSeguro(tab.url, tab.title) || "",
+    windowTitle: obterTituloSeguro(tab.url, tab.windowTitle),
+    screenName: obterNomeTelaSeguro(tab.url, tab.screenName),
+    screenContext: obterContextoTelaSeguro(tab.url, tab.screenContext),
     inicio: timestamp,
     lastActivity: timestamp,
     intervalStart: timestamp,
@@ -416,7 +505,8 @@ async function registrarInteracao(
   tabId,
   interaction = "unknown",
   windowTitle = null,
-  screenName = null
+  screenName = null,
+  screenContext = null
 ) {
   const tab = await chrome.tabs.get(tabId);
   if (!tab.active) {
@@ -430,7 +520,10 @@ async function registrarInteracao(
   }
 
   if (!currentSession) {
-    await iniciarSessao({ ...tab, windowTitle, screenName }, now);
+    await iniciarSessao(
+      { ...tab, windowTitle, screenName, screenContext },
+      now
+    );
     return;
   }
 
@@ -440,13 +533,17 @@ async function registrarInteracao(
     );
   }
 
-  currentSession.titulo = tab.title || currentSession.titulo || "";
-  if (typeof windowTitle === "string" && windowTitle.trim()) {
-    currentSession.windowTitle = windowTitle;
+  const safeTitle = obterTituloSeguro(tab.url, tab.title);
+  currentSession.titulo = safeTitle || "";
+  const safeWindowTitle = obterTituloSeguro(tab.url, windowTitle);
+  if (safeWindowTitle) {
+    currentSession.windowTitle = safeWindowTitle;
   }
-  if (typeof screenName === "string" && screenName.trim()) {
-    currentSession.screenName = screenName.trim();
-  }
+  currentSession.screenName = obterNomeTelaSeguro(tab.url, screenName);
+  currentSession.screenContext = obterContextoTelaSeguro(
+    tab.url,
+    screenContext
+  );
 
   if (currentSession.isActive) {
     const inactivityDeadline =
@@ -706,10 +803,14 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
     empresa: info.empresa,
     aplicacao: info.aplicacao,
     categoria: info.categoria,
-    titulo: sessao.titulo,
-    tab_title: sessao.titulo || null,
-    window_title: sessao.windowTitle || null,
-    screen_name: sessao.screenName || null,
+    titulo: obterTituloSeguro(sessao.url, sessao.titulo) || "",
+    tab_title: obterTituloSeguro(sessao.url, sessao.titulo),
+    window_title: obterTituloSeguro(sessao.url, sessao.windowTitle),
+    screen_name: obterNomeTelaSeguro(sessao.url, sessao.screenName),
+    screen_context: obterContextoTelaSeguro(
+      sessao.url,
+      sessao.screenContext
+    ),
     inicio: new Date(inicioMs).toISOString(),
     fim: new Date(fimMs).toISOString(),
     duracaoSegundos,
@@ -754,6 +855,7 @@ async function enviarParaSupabase(registro) {
           tab_title: registro.tab_title,
           window_title: registro.window_title,
           screen_name: registro.screen_name,
+          screen_context: registro.screen_context,
           source: "chrome-extension"
         })
       }
@@ -910,6 +1012,14 @@ function identificarAplicacao(url, hostname) {
     };
   }
 
+  if (hostLower.includes("gemini")) {
+    return {
+      empresa: "Google",
+      aplicacao: "Gemini",
+      categoria: "IA"
+    };
+  }
+
   if (hostLower.includes("claude")) {
     return {
       empresa: "Anthropic",
@@ -1032,11 +1142,13 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   void serializarOperacao(() => registrarTroca(activeInfo.tabId));
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.title || changeInfo.status === "complete") {
     void serializarOperacao(async () => {
       if (changeInfo.title && currentSession?.tabId === tabId) {
-        currentSession.titulo = changeInfo.title;
+        const pageUrl = tab?.url || changeInfo.url || currentSession.url;
+        currentSession.titulo =
+          obterTituloSeguro(pageUrl, changeInfo.title) || "";
         await persistirSessao();
       }
 
@@ -1076,7 +1188,8 @@ chrome.runtime.onMessage.addListener((message, sender) => {
       sender.tab.id,
       message.interaction,
       message.windowTitle,
-      message.screenName
+      message.screenName,
+      message.screenContext
     )
   );
 });
