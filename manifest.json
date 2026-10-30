@@ -6,6 +6,7 @@
 
   "permissions": [
     "tabs",
+    "scripting",
     "storage",
     "unlimitedStorage",
     "alarms",

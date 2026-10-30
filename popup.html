@@ -26,6 +26,32 @@
       background: #f3f3f3;
       overflow-wrap: anywhere;
     }
+
+    #capture-diagnostics {
+      margin-bottom: 12px;
+      padding: 8px;
+      background: #f3f3f3;
+    }
+
+    #capture-diagnostics dl {
+      margin: 8px 0 0;
+    }
+
+    #capture-diagnostics dt {
+      margin-top: 6px;
+      font-weight: bold;
+    }
+
+    #capture-diagnostics dd {
+      margin: 2px 0 0;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    #diagnostics-updated {
+      color: #555;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
@@ -33,6 +59,22 @@
   <h2>Portal Produtividade</h2>
 
   <section id="sync-status" aria-live="polite"></section>
+  <section id="capture-diagnostics" aria-live="polite">
+    <strong>Diagnóstico da captura (último clique)</strong>
+    <div id="diagnostics-updated">Aguardando clique em uma página...</div>
+    <dl>
+      <dt>URL</dt>
+      <dd id="diagnostic-url">—</dd>
+      <dt>tab_title</dt>
+      <dd id="diagnostic-tab-title">—</dd>
+      <dt>window_title</dt>
+      <dd id="diagnostic-window-title">—</dd>
+      <dt>screen_name</dt>
+      <dd id="diagnostic-screen-name">—</dd>
+      <dt>screen_context</dt>
+      <dd id="diagnostic-screen-context">—</dd>
+    </dl>
+  </section>
   <div id="lista"></div>
 
   <script src="popup.js"></script>

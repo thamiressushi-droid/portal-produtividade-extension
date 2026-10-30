@@ -1,4 +1,13 @@
 (() => {
+  const bridgeGlobalKey = "__portalIdentityBridgeLoaded";
+  if (globalThis[bridgeGlobalKey]) {
+    console.info(
+      "[Portal Extensão][content] Bridge de identidade já estava ativo"
+    );
+    return;
+  }
+  globalThis[bridgeGlobalKey] = true;
+
   const pageIdentityMessageType = "identity";
   const backgroundIdentityMessageType = "PORTAL_IDENTITY_CHANGED";
   const backgroundIdentityRequestType = "PORTAL_GET_AUTHENTICATED_USER";

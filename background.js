@@ -5,6 +5,7 @@ const PORTAL_URL_PATTERNS = [
   "https://portal-produtividade.gehaka.workers.dev/*"
 ];
 const PORTAL_IDENTITY_REQUEST = "PORTAL_GET_AUTHENTICATED_USER";
+const PORTAL_IDENTITY_SCRIPT = "content-portal-identity.js";
 const OUTBOX_DATABASE_NAME = "portal-prod-activity";
 const OUTBOX_DATABASE_VERSION = 1;
 const OUTBOX_STORE_NAME = "outbox";
@@ -131,31 +132,56 @@ async function consultarIdentidadePortal() {
       continue;
     }
 
+    let response;
     try {
-      const response = await chrome.tabs.sendMessage(tab.id, {
+      response = await chrome.tabs.sendMessage(tab.id, {
         type: PORTAL_IDENTITY_REQUEST
       });
-      const userId =
-        typeof response?.userId === "string" ? response.userId.trim() : "";
-      console.info(
-        "[Portal Extensão][background] Resultado da consulta à aba do portal",
-        {
-          tabId: tab.id,
-          receivedResponse: response !== undefined,
-          userId: userId || null
-        }
-      );
-      if (userId) {
-        return userId;
-      }
     } catch (error) {
       console.warn(
-        "[Portal Extensão][background] Consulta à aba do portal falhou",
+        "[Portal Extensão][background] Aba sem listener de identidade; injetando bridge",
         {
           tabId: tab.id,
           error: error.message || String(error)
         }
       );
+
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: [PORTAL_IDENTITY_SCRIPT]
+        });
+        console.info(
+          "[Portal Extensão][background] Bridge de identidade injetado na aba",
+          { tabId: tab.id, script: PORTAL_IDENTITY_SCRIPT }
+        );
+        response = await chrome.tabs.sendMessage(tab.id, {
+          type: PORTAL_IDENTITY_REQUEST
+        });
+      } catch (recoveryError) {
+        console.error(
+          "[Portal Extensão][background] Não foi possível consultar a identidade após injetar o bridge",
+          {
+            tabId: tab.id,
+            error: recoveryError.message || String(recoveryError)
+          }
+        );
+        continue;
+      }
+    }
+
+    const userId =
+      typeof response?.userId === "string" ? response.userId.trim() : "";
+    console.info(
+      "[Portal Extensão][background] Resultado da consulta à aba do portal",
+      {
+        tabId: tab.id,
+        receivedResponse: response !== undefined,
+        userId: userId || null
+      }
+    );
+    if (userId) {
+      return userId;
     }
   }
 

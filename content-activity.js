@@ -126,6 +126,40 @@
     return result;
   }
 
+  function reportCaptureDiagnostics(event) {
+    const privateApplicationName = getPrivateApplicationName(
+      location.hostname
+    );
+    const protheusScreen = privateApplicationName
+      ? { screenName: privateApplicationName, screenContext: null }
+      : readProtheusScreen();
+    const diagnostics = {
+      url: location.href,
+      tab_title: document.title || null,
+      window_title: document.title || null,
+      screen_name: protheusScreen.screenName,
+      screen_context: protheusScreen.screenContext,
+      capturedAt: new Date().toISOString(),
+      interaction: event.type
+    };
+
+    chrome.storage.local.set({ captureDiagnostics: diagnostics }, () => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        console.error(
+          "[Portal Extensão][activity] Falha ao salvar diagnóstico da captura",
+          runtimeError.message
+        );
+        return;
+      }
+
+      console.info(
+        "[Portal Extensão][activity] Diagnóstico da captura atualizado",
+        diagnostics
+      );
+    });
+  }
+
   function reportActivity(event) {
     console.info(
       "[Portal Extensão][activity] Atividade detectada",
@@ -233,6 +267,10 @@
       capture: true,
       passive: true,
     });
+  });
+  document.addEventListener("click", reportCaptureDiagnostics, {
+    capture: true,
+    passive: true
   });
 
   console.info(
