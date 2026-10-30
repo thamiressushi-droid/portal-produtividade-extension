@@ -931,7 +931,9 @@ async function iniciarSessao(tab, startTime = Date.now()) {
       timestamp,
       tabId: tab.id,
       url: tab.url,
-      userId: currentSession.userId ?? null
+      userId: currentSession.userId ?? null,
+      screen_name: currentSession.screenName ?? null,
+      screen_context: currentSession.screenContext ?? null
     }
   );
 }
@@ -1029,6 +1031,15 @@ async function registrarInteracao(
   currentSession.screenContext = obterContextoTelaSeguro(
     tab.url,
     screenContext
+  );
+  console.info(
+    "[Portal Extensão][background] Contexto recebido na atividade",
+    {
+      tabId,
+      hostname: obterDadosUrl(tab.url).hostname,
+      screen_name: currentSession.screenName ?? null,
+      screen_context: currentSession.screenContext ?? null
+    }
   );
 
   if (currentSession.isActive) {
@@ -1480,22 +1491,28 @@ function obterDadosUrl(url) {
  */
 async function salvarRegistro(registro) {
   const clientEventId = criarIdEvento();
+  const body = {
+    client_event_id: clientEventId,
+    user_id: registro.user_id ?? await obterUserId(),
+    domain: registro.hostname,
+    started_at: registro.inicio,
+    ended_at: registro.fim,
+    is_active: registro.is_active,
+    tab_title: registro.tab_title,
+    window_title: registro.window_title,
+    screen_name: registro.screen_name,
+    screen_context: registro.screen_context,
+    source: "chrome-extension"
+  };
+  console.info("[Portal Extensão][background] Campos de contexto no outbox", {
+    endpoint: "web_events?on_conflict=client_event_id",
+    screen_name: body.screen_name ?? null,
+    screen_context: body.screen_context ?? null
+  });
   await enfileirarRequisicao({
     clientEventId,
     endpoint: "web_events?on_conflict=client_event_id",
-    body: {
-      client_event_id: clientEventId,
-      user_id: registro.user_id ?? await obterUserId(),
-      domain: registro.hostname,
-      started_at: registro.inicio,
-      ended_at: registro.fim,
-      is_active: registro.is_active,
-      tab_title: registro.tab_title,
-      window_title: registro.window_title,
-      screen_name: registro.screen_name,
-      screen_context: registro.screen_context,
-      source: "chrome-extension"
-    }
+    body
   });
 
   try {

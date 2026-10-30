@@ -74,6 +74,10 @@
 
   function readProtheusScreen() {
     if (!isProtheusHost(location.hostname)) {
+      console.info(
+        "[Portal Extensão][activity] Captura DOM Protheus não executada: host não reconhecido",
+        { hostname: location.hostname }
+      );
       return { screenName: null, screenContext: null };
     }
 
@@ -104,10 +108,22 @@
         return rightFontSize - leftFontSize;
       });
 
-    return {
+    const result = {
       screenName: activeTabText.slice(0, 120) || captions[0]?.caption || null,
       screenContext: captions[0]?.caption || null
     };
+    console.info(
+      "[Portal Extensão][activity] Resultado da captura DOM Protheus",
+      {
+        hostname: location.hostname,
+        executed: true,
+        activeTabFound: Boolean(activeTab),
+        visibleCaptionCount: captions.length,
+        screen_name: result.screenName,
+        screen_context: result.screenContext
+      }
+    );
+    return result;
   }
 
   function reportActivity(event) {
