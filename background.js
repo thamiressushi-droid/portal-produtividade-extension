@@ -11,6 +11,8 @@ const OUTBOX_DATABASE_VERSION = 1;
 const OUTBOX_STORE_NAME = "outbox";
 const OUTBOX_SYNC_ALARM = "portal-outbox-sync";
 const SYNC_STATUS_STORAGE_KEY = "syncStatus";
+const PORTAL_USER_ID_STORAGE_KEY = "portalUserId";
+const PORTAL_ACCESS_TOKEN_STORAGE_KEY = "portalAccessToken";
 const INACTIVITY_EVENT_FIELDS = new Set([
   "user_id",
   "started_at",
@@ -65,55 +67,100 @@ async function lerUserIdPersistido() {
   }
 }
 
-async function persistirIdentidade(userId, source) {
-  const identityStorageKey = "portalUserId";
-  const { portalUserId } = await chrome.storage.local.get(identityStorageKey);
+async function persistirIdentidade(userId, { name, accessToken = null }) {
+  const {
+    [PORTAL_USER_ID_STORAGE_KEY]: portalUserId,
+    [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: portalAccessToken
+  } = await chrome.storage.local.get([
+    PORTAL_USER_ID_STORAGE_KEY,
+    PORTAL_ACCESS_TOKEN_STORAGE_KEY
+  ]);
   const currentUserId =
     typeof portalUserId === "string" ? portalUserId.trim() : "";
+  const currentAccessToken =
+    typeof portalAccessToken === "string" ? portalAccessToken : "";
+  const normalizedAccessToken =
+    typeof accessToken === "string" && accessToken.trim()
+      ? accessToken.trim()
+      : null;
 
   console.info("[Portal Extensão][background] Leitura para persistência", {
-    source,
+    source: name,
     portalUserId: currentUserId || null,
-    found: Boolean(currentUserId)
+    found: Boolean(currentUserId),
+    receivedJwt: Boolean(normalizedAccessToken)
   });
 
   if (userId === null) {
-    await chrome.storage.local.remove(identityStorageKey);
-    const stored = await chrome.storage.local.get(identityStorageKey);
-    if (stored[identityStorageKey] !== undefined) {
+    await chrome.storage.local.remove([
+      PORTAL_USER_ID_STORAGE_KEY,
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY
+    ]);
+    const stored = await chrome.storage.local.get([
+      PORTAL_USER_ID_STORAGE_KEY,
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY
+    ]);
+    if (
+      stored[PORTAL_USER_ID_STORAGE_KEY] !== undefined ||
+      stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY] !== undefined
+    ) {
       throw new Error("Storage não confirmou a remoção da identidade.");
     }
 
     console.info("[Portal Extensão][background] Identidade removida", {
-      source,
+      source: name,
       portalUserId: null,
       hadIdentity: Boolean(currentUserId)
     });
   } else {
-    if (currentUserId === userId) {
+    const identityChanged = currentUserId !== userId;
+    const tokenChanged =
+      normalizedAccessToken !== null &&
+      normalizedAccessToken !== currentAccessToken;
+    if (!identityChanged && !tokenChanged) {
       console.info("[Portal Extensão][background] Identidade já persistida", {
-        source,
+        source: name,
         portalUserId: currentUserId,
-        hasIdentity: true
+        hasIdentity: true,
+        hasJwt: Boolean(currentAccessToken)
       });
       return false;
     }
 
-    await chrome.storage.local.set({ [identityStorageKey]: userId });
-    const stored = await chrome.storage.local.get(identityStorageKey);
-    if (stored[identityStorageKey] !== userId) {
+    if (identityChanged && !normalizedAccessToken) {
+      await chrome.storage.local.remove(PORTAL_ACCESS_TOKEN_STORAGE_KEY);
+    }
+
+    await chrome.storage.local.set({
+      [PORTAL_USER_ID_STORAGE_KEY]: userId,
+      ...(normalizedAccessToken
+        ? { [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: normalizedAccessToken }
+        : {})
+    });
+    const stored = await chrome.storage.local.get([
+      PORTAL_USER_ID_STORAGE_KEY,
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY
+    ]);
+    if (
+      stored[PORTAL_USER_ID_STORAGE_KEY] !== userId ||
+      (normalizedAccessToken &&
+        stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY] !== normalizedAccessToken)
+    ) {
       throw new Error("Storage não confirmou a identidade esperada.");
     }
 
     console.info("[Portal Extensão][background] Identidade gravada", {
-      source,
+      source: name,
       portalUserId: userId,
-      hasIdentity: true
+      hasIdentity: true,
+      hasJwt: Boolean(stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY])
     });
   }
 
-  void serializarOperacao(() => registrarTrocaDeIdentidade(userId));
-  if (userId !== null) {
+  if (currentUserId !== userId) {
+    void serializarOperacao(() => registrarTrocaDeIdentidade(userId));
+  }
+  if (userId !== null && normalizedAccessToken) {
     void sincronizarOutbox();
   }
   return true;
@@ -192,21 +239,26 @@ async function consultarIdentidadePortal() {
 
     const userId =
       typeof response?.userId === "string" ? response.userId.trim() : "";
+    const accessToken =
+      typeof response?.accessToken === "string"
+        ? response.accessToken.trim()
+        : "";
     console.info(
-      "[Portal Extensão][background] Resultado da consulta à aba do portal",
+      "[Portal Extensão][background] Resultado da consulta à sessão do portal",
       {
         tabId: tab.id,
         receivedResponse: response !== undefined,
-        userId: userId || null
+        userId: userId || null,
+        receivedJwt: Boolean(accessToken)
       }
     );
     if (userId) {
-      return userId;
+      return { userId, accessToken: accessToken || null };
     }
   }
 
   console.info(
-    "[Portal Extensão][background] Consulta ao portal sem identidade",
+    "[Portal Extensão][background] Consulta ao portal sem sessão",
     { userId: null }
   );
   return null;
@@ -223,9 +275,12 @@ async function obterUserId() {
       return persistedUserId;
     }
 
-    const userId = await consultarIdentidadePortal();
-    if (userId) {
-      await persistirIdentidade(userId, "portal_tab_recovery");
+    const portalSession = await consultarIdentidadePortal();
+    if (portalSession?.userId) {
+      await persistirIdentidade(portalSession.userId, {
+        name: "portal_tab_recovery",
+        accessToken: portalSession.accessToken
+      });
       const recoveredUserId = await lerUserIdPersistido();
       console.info("[Portal Extensão][background] Resultado de obterUserId()", {
         userId: recoveredUserId,
@@ -505,6 +560,42 @@ async function registrarFalhaDeEnvio(event, error) {
   });
 }
 
+function decodificarClaimsJwt(accessToken) {
+  const encodedPayload = accessToken.split(".")[1];
+  if (!encodedPayload) {
+    throw new Error("JWT da sessão do portal está malformado.");
+  }
+
+  try {
+    const base64 = encodedPayload
+      .replace(/-/g, "+")
+      .replace(/_/g, "/")
+      .padEnd(Math.ceil(encodedPayload.length / 4) * 4, "=");
+    const claims = JSON.parse(atob(base64));
+    if (!claims || typeof claims !== "object" || Array.isArray(claims)) {
+      throw new Error("O payload do JWT não contém um objeto de claims.");
+    }
+    return claims;
+  } catch (error) {
+    throw new Error(`Não foi possível ler as claims do JWT: ${error.message}`);
+  }
+}
+
+function registrarRoleWebEvent(role) {
+  console.info("[Portal Extensão][sync] Role da requisição web_events", {
+    endpoint: "web_events",
+    role
+  });
+  void atualizarStatusSincronizacao({ lastWebEventRole: role }).catch(
+    (error) => {
+      console.error(
+        "[Portal Extensão][sync] Falha ao persistir diagnóstico da role web_events",
+        error
+      );
+    }
+  );
+}
+
 async function enviarEventoPendente(event) {
   const body = prepararBodyRequisicao(event.endpoint, event.body);
   if (event.method === "POST" && !body.user_id) {
@@ -514,6 +605,55 @@ async function enviarEventoPendente(event) {
     }
   }
 
+  const isWebEvent = event.endpoint.split("?")[0] === "web_events";
+  let authorization;
+  if (isWebEvent) {
+    const {
+      [PORTAL_USER_ID_STORAGE_KEY]: portalUserId,
+      [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: accessToken
+    } = await chrome.storage.local.get([
+      PORTAL_USER_ID_STORAGE_KEY,
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY
+    ]);
+
+    if (typeof accessToken !== "string" || !accessToken.trim()) {
+      registrarRoleWebEvent("não enviada (JWT ausente)");
+      throw new Error(
+        "JWT da sessão do portal indisponível; web_events não será enviada como anon."
+      );
+    }
+
+    let claims;
+    try {
+      claims = decodificarClaimsJwt(accessToken);
+    } catch (error) {
+      registrarRoleWebEvent("não enviada (JWT inválido)");
+      throw error;
+    }
+    const role =
+      typeof claims.role === "string" ? claims.role : "desconhecida";
+    if (role !== "authenticated") {
+      registrarRoleWebEvent(`não enviada (JWT role=${role})`);
+      throw new Error(
+        `JWT do portal usa role=${role}; web_events exige role authenticated.`
+      );
+    }
+
+    if (
+      typeof claims.sub !== "string" ||
+      claims.sub !== body.user_id ||
+      portalUserId !== body.user_id
+    ) {
+      registrarRoleWebEvent("não enviada (JWT/user_id incompatíveis)");
+      throw new Error(
+        "JWT do portal não corresponde ao user_id do evento; web_events não será enviada."
+      );
+    }
+
+    authorization = `Bearer ${accessToken}`;
+    registrarRoleWebEvent("authenticated");
+  }
+
   const response = await fetch(
     `${SUPABASE_URL}/rest/v1/${event.endpoint}`,
     {
@@ -521,6 +661,7 @@ async function enviarEventoPendente(event) {
       signal: AbortSignal.timeout(15_000),
       headers: {
         "apikey": SUPABASE_KEY,
+        ...(authorization ? { "Authorization": authorization } : {}),
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=representation"
       },
@@ -1712,6 +1853,9 @@ chrome.runtime.onMessage.addListener(
         senderTabUrl: sender?.tab?.url,
         hasUserId:
           typeof message.userId === "string",
+        receivedJwt:
+          typeof message.accessToken === "string" &&
+          Boolean(message.accessToken.trim()),
         userIdIsNull:
           message.userId === null
       }
@@ -1735,6 +1879,10 @@ chrome.runtime.onMessage.addListener(
       typeof message.userId === "string"
         ? message.userId.trim()
         : null;
+    const accessToken =
+      typeof message.accessToken === "string"
+        ? message.accessToken.trim()
+        : null;
 
     if (userId === "") {
       console.error(
@@ -1747,7 +1895,25 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
-    void persistirIdentidade(userId, "portal_identity_message")
+    if (
+      message.accessToken !== undefined &&
+      message.accessToken !== null &&
+      (typeof message.accessToken !== "string" || !accessToken)
+    ) {
+      console.error(
+        "[Portal Extensão][background] Sessão rejeitada: accessToken inválido"
+      );
+      sendResponse({
+        ok: false,
+        stage: "validation"
+      });
+      return;
+    }
+
+    void persistirIdentidade(userId, {
+      name: "portal_identity_message",
+      accessToken
+    })
       .then((changed) => {
         sendResponse({
           ok: true,

@@ -12,9 +12,9 @@
   const backgroundIdentityMessageType = "PORTAL_IDENTITY_CHANGED";
   const backgroundIdentityRequestType = "PORTAL_GET_AUTHENTICATED_USER";
   const supabaseAuthStorageKey = "sb-lqiftfrbdtqcrfxcthao-auth-token";
-  let lastReportedUserId;
+  let lastReportedIdentity;
 
-  function getAuthUserId() {
+  function getAuthSession() {
     try {
       let serializedSession = window.localStorage.getItem(
         supabaseAuthStorageKey
@@ -25,7 +25,7 @@
           found: false,
           storageKey: supabaseAuthStorageKey
         });
-        return null;
+        return { userId: null, accessToken: null };
       }
 
       if (serializedSession.startsWith("base64-")) {
@@ -43,31 +43,41 @@
         session?.currentSession?.user?.id ||
         session?.data?.user?.id ||
         session?.data?.session?.user?.id;
+      const accessToken =
+        session?.access_token ||
+        session?.session?.access_token ||
+        session?.currentSession?.access_token ||
+        session?.data?.session?.access_token;
 
       const normalizedUserId =
         typeof userId === "string" && userId.trim()
           ? userId.trim()
           : null;
-      console.info("[Portal Extensão][content] Leitura da identidade", {
+      const normalizedAccessToken =
+        typeof accessToken === "string" && accessToken.trim()
+          ? accessToken.trim()
+          : null;
+      console.info("[Portal Extensão][content] Leitura da sessão", {
         userId: normalizedUserId,
+        receivedJwt: Boolean(normalizedAccessToken),
         storageKey: supabaseAuthStorageKey
       });
-      return normalizedUserId;
+      return { userId: normalizedUserId, accessToken: normalizedAccessToken };
     } catch (error) {
       console.warn(
-        "[Portal Extensão][content] Não foi possível ler user.id da sessão Supabase",
+        "[Portal Extensão][content] Não foi possível ler a sessão Supabase",
         error
       );
-      console.info("[Portal Extensão][content] Leitura da identidade", {
+      console.info("[Portal Extensão][content] Leitura da sessão", {
         found: false,
         storageKey: supabaseAuthStorageKey,
         failed: true
       });
-      return null;
+      return { userId: null, accessToken: null };
     }
   }
 
-  function notifyBackground(userId) {
+  function notifyBackground(userId, accessToken = null) {
     if (
       userId !== null &&
       (typeof userId !== "string" || !userId.trim())
@@ -75,24 +85,30 @@
       return;
     }
 
+    const normalizedAccessToken =
+      typeof accessToken === "string" && accessToken.trim()
+        ? accessToken.trim()
+        : null;
+    const identityKey = `${userId || ""}:${normalizedAccessToken || ""}`;
     if (
-      lastReportedUserId !== undefined &&
-      userId === lastReportedUserId
+      lastReportedIdentity !== undefined &&
+      identityKey === lastReportedIdentity
     ) {
       return;
     }
 
-    lastReportedUserId = userId;
+    lastReportedIdentity = identityKey;
     chrome.runtime.sendMessage(
       {
         type: backgroundIdentityMessageType,
-        userId
+        userId,
+        accessToken: normalizedAccessToken
       },
       (response) => {
         const runtimeError = chrome.runtime.lastError;
 
         if (runtimeError) {
-          lastReportedUserId = undefined;
+          lastReportedIdentity = undefined;
           console.error(
             "[Portal Extensão][content] Falha ao persistir identidade",
             runtimeError.message
@@ -101,7 +117,7 @@
         }
 
         if (!response?.ok) {
-          lastReportedUserId = undefined;
+          lastReportedIdentity = undefined;
           console.error(
             "[Portal Extensão][content] Background não confirmou a identidade",
             response
@@ -150,6 +166,7 @@
     const userId = Object.hasOwn(data, "userId")
       ? data.userId
       : data.user?.id ?? data.session?.user?.id;
+    const authSession = getAuthSession();
 
     if (userId === undefined) {
       console.error(
@@ -160,7 +177,7 @@
 
     if (typeof userId !== "string" || !userId.trim()) {
       if (userId === null) {
-        notifyBackground(null);
+        notifyBackground(null, null);
         return;
       }
 
@@ -171,7 +188,13 @@
       return;
     }
 
-    notifyBackground(userId.trim());
+    const normalizedUserId = userId.trim();
+    notifyBackground(
+      normalizedUserId,
+      authSession.userId === normalizedUserId
+        ? authSession.accessToken
+        : null
+    );
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -179,18 +202,21 @@
       return;
     }
 
-    const userId = getAuthUserId();
+    const authSession = getAuthSession();
     console.info(
-      "[Portal Extensão][content] Identidade consultada pelo background",
-      { userId }
+      "[Portal Extensão][content] Sessão consultada pelo background",
+      {
+        userId: authSession.userId,
+        receivedJwt: Boolean(authSession.accessToken)
+      }
     );
-    sendResponse({ userId });
+    sendResponse(authSession);
   });
 
   function refreshAuthIdentity() {
-    const userId = getAuthUserId();
-    if (userId) {
-      notifyBackground(userId);
+    const authSession = getAuthSession();
+    if (authSession.userId) {
+      notifyBackground(authSession.userId, authSession.accessToken);
     }
   }
 
@@ -202,13 +228,13 @@
           "[Portal Extensão][content] Remoção da sessão detectada; confirmando antes de apagar portalUserId"
         );
         window.setTimeout(() => {
-          const currentUserId = getAuthUserId();
-          if (currentUserId) {
+          const currentSession = getAuthSession();
+          if (currentSession.userId) {
             console.info(
               "[Portal Extensão][content] Sessão restaurada; identidade preservada",
-              { userId: currentUserId }
+              { userId: currentSession.userId }
             );
-            notifyBackground(currentUserId);
+            notifyBackground(currentSession.userId, currentSession.accessToken);
             return;
           }
 
@@ -216,7 +242,7 @@
             "[Portal Extensão][content] Logout confirmado pela remoção da sessão",
             { userId: null }
           );
-          notifyBackground(null);
+          notifyBackground(null, null);
         }, 1_000);
       } else {
         refreshAuthIdentity();

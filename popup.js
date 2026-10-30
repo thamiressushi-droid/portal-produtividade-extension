@@ -39,6 +39,7 @@ function renderizarStatusSincronizacao(status = {}) {
   const elemento = document.getElementById("sync-status");
   elemento.textContent = [
     `Eventos pendentes: ${status.pendingCount ?? 0}`,
+    `Role usada em web_events: ${status.lastWebEventRole || "Aguardando requisição"}`,
     `Último envio com sucesso: ${formatarData(status.lastSuccessAt)}`,
     `Último erro: ${status.lastError || "Nenhum"}`
   ].join("\n");

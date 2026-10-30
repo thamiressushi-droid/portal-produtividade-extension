@@ -35,3 +35,11 @@ uma identidade já persistida. Um logout explícito remove a identidade. Eventos
 já enfileirados mantêm a identidade que tinham no momento da captura. O popup
 mostra a contagem de eventos pendentes, o último envio bem-sucedido e o último
 erro.
+
+O bridge também lê o `access_token` da sessão Supabase do portal e o persiste
+em `chrome.storage.local`. As gravações em `web_events` enviam esse JWT no
+cabeçalho `Authorization: Bearer` e só são feitas quando ele declara a role
+`authenticated` e corresponde ao `user_id` do evento; sem isso, a requisição é
+mantida no outbox em vez de usar a role `anon`. A role usada ou o motivo do
+bloqueio aparece nos logs da extensão e no status do popup. As demais chamadas
+Supabase permanecem inalteradas.
