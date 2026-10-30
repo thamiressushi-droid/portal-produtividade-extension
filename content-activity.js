@@ -2,14 +2,26 @@
   const backgroundMessageType = "PORTAL_USER_ACTIVITY";
   const minimumIntervalMs = 5000;
   const privateApplications = [
-    { name: "Copilot", domains: ["copilot.microsoft.com", "copilot.com"] },
+    {
+      name: "Copilot",
+      domains: [
+        "copilot.microsoft.com",
+        "copilot.com",
+        "m365.cloud.microsoft"
+      ]
+    },
     { name: "ChatGPT", domains: ["chatgpt.com", "chat.openai.com"] },
     { name: "Claude", domains: ["claude.ai"] },
     { name: "Gemini", domains: ["gemini.google.com"] },
     { name: "WhatsApp", domains: ["whatsapp.com"] },
     {
       name: "Teams",
-      domains: ["teams.microsoft.com", "teams.live.com"]
+      domains: [
+        "teams.microsoft.com",
+        "teams.live.com",
+        "teams.cloud.microsoft",
+        "teams.microsoft.us"
+      ]
     },
     {
       name: "Outlook",
@@ -17,7 +29,9 @@
         "outlook.com",
         "outlook.live.com",
         "outlook.office.com",
-        "outlook.office365.com"
+        "outlook.office365.com",
+        "outlook.office365.us",
+        "outlook.cloud.microsoft"
       ]
     },
     { name: "Gmail", domains: ["mail.google.com"] },

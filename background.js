@@ -5,6 +5,11 @@ const PORTAL_URL_PATTERNS = [
   "https://portal-produtividade.gehaka.workers.dev/*"
 ];
 const PORTAL_IDENTITY_REQUEST = "PORTAL_GET_AUTHENTICATED_USER";
+const OUTBOX_DATABASE_NAME = "portal-prod-activity";
+const OUTBOX_DATABASE_VERSION = 1;
+const OUTBOX_STORE_NAME = "outbox";
+const OUTBOX_SYNC_ALARM = "portal-outbox-sync";
+const SYNC_STATUS_STORAGE_KEY = "syncStatus";
 
 function ehOrigemPortal(sender) {
   try {
@@ -19,74 +24,47 @@ function ehOrigemPortal(sender) {
   }
 }
 
-async function consultarIdentidadePortal() {
-  const portalTabs = await chrome.tabs.query({ url: PORTAL_URL_PATTERNS });
-
-  for (const tab of portalTabs) {
-    if (typeof tab.id !== "number") {
-      continue;
-    }
-
-    try {
-      const response = await chrome.tabs.sendMessage(tab.id, {
-        type: PORTAL_IDENTITY_REQUEST
-      });
-      const userId =
-        typeof response?.userId === "string" ? response.userId.trim() : "";
-
-      if (userId) {
-        await chrome.storage.local.set({ portalUserId: userId });
-        return userId;
-      }
-    } catch (error) {
-      console.info(
-        "[Portal Extensão][background] Aba do portal ainda não respondeu à consulta de identidade",
-        { tabId: tab.id, error: error.message }
-      );
-    }
-  }
-
-  return "";
-}
-
-async function obterUserId() {
+async function obterUserIdPersistido() {
   const { portalUserId } = await chrome.storage.local.get("portalUserId");
-  let userId =
-    typeof portalUserId === "string" ? portalUserId.trim() : "";
+  const userId = typeof portalUserId === "string" ? portalUserId.trim() : "";
 
-  if (!userId) {
-    userId = await consultarIdentidadePortal();
-  }
-
-  if (!userId) {
-    throw new Error("Usuário autenticado do portal não encontrado.");
-  }
-
-  console.info(
-    "[Portal Extensão][background] Identidade selecionada para envio",
-    { userId }
-  );
-
-  return userId;
+  return userId || null;
 }
 
 const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
 const INACTIVITY_SETTINGS_REFRESH_ALARM = "portal-inactivity-settings-refresh";
 const INACTIVITY_ALARM = "portal-session-inactivity";
 const PRIVATE_APPLICATIONS = [
-  { name: "Copilot", domains: ["copilot.microsoft.com", "copilot.com"] },
+  {
+    name: "Copilot",
+    domains: [
+      "copilot.microsoft.com",
+      "copilot.com",
+      "m365.cloud.microsoft"
+    ]
+  },
   { name: "ChatGPT", domains: ["chatgpt.com", "chat.openai.com"] },
   { name: "Claude", domains: ["claude.ai"] },
   { name: "Gemini", domains: ["gemini.google.com"] },
   { name: "WhatsApp", domains: ["whatsapp.com"] },
-  { name: "Teams", domains: ["teams.microsoft.com", "teams.live.com"] },
+  {
+    name: "Teams",
+    domains: [
+      "teams.microsoft.com",
+      "teams.live.com",
+      "teams.cloud.microsoft",
+      "teams.microsoft.us"
+    ]
+  },
   {
     name: "Outlook",
     domains: [
       "outlook.com",
       "outlook.live.com",
       "outlook.office.com",
-      "outlook.office365.com"
+      "outlook.office365.com",
+      "outlook.office365.us",
+      "outlook.cloud.microsoft"
     ]
   },
   { name: "Gmail", domains: ["mail.google.com"] },
@@ -97,6 +75,293 @@ const PRIVATE_APPLICATIONS = [
 let currentSession = null;
 let inactivityThresholdSeconds = null;
 let sessionOperation = Promise.resolve();
+let outboxDatabasePromise;
+let synchronizationOperation = Promise.resolve();
+
+function abrirOutboxDatabase() {
+  if (!outboxDatabasePromise) {
+    outboxDatabasePromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(
+        OUTBOX_DATABASE_NAME,
+        OUTBOX_DATABASE_VERSION
+      );
+
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        const store = database.objectStoreNames.contains(OUTBOX_STORE_NAME)
+          ? request.transaction.objectStore(OUTBOX_STORE_NAME)
+          : database.createObjectStore(OUTBOX_STORE_NAME, {
+            keyPath: "id",
+            autoIncrement: true
+          });
+        if (!store.indexNames.contains("clientEventId")) {
+          store.createIndex("clientEventId", "clientEventId", {
+            unique: true
+          });
+        }
+        if (!store.indexNames.contains("chronological")) {
+          store.createIndex("chronological", ["sortAt", "id"]);
+        }
+      };
+      request.onsuccess = () => {
+        request.result.onversionchange = () => {
+          request.result.close();
+          outboxDatabasePromise = null;
+        };
+        resolve(request.result);
+      };
+      request.onerror = () => {
+        outboxDatabasePromise = null;
+        reject(request.error || new Error("Não foi possível abrir o outbox."));
+      };
+      request.onblocked = () => {
+        outboxDatabasePromise = null;
+        reject(new Error("A abertura do outbox IndexedDB foi bloqueada."));
+      };
+    });
+  }
+
+  return outboxDatabasePromise;
+}
+
+function aguardarTransacao(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () =>
+      reject(transaction.error || new Error("Transação IndexedDB cancelada."));
+    transaction.onerror = () =>
+      reject(transaction.error || new Error("Falha na transação IndexedDB."));
+  });
+}
+
+function criarIdEvento() {
+  return crypto.randomUUID();
+}
+
+async function contarEventosPendentes() {
+  const database = await abrirOutboxDatabase();
+  const transaction = database.transaction(OUTBOX_STORE_NAME, "readonly");
+  const completion = aguardarTransacao(transaction);
+  const request = transaction.objectStore(OUTBOX_STORE_NAME).count();
+  const count = await new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      reject(request.error || new Error("Falha ao contar eventos pendentes."));
+  });
+  await completion;
+  return count;
+}
+
+async function atualizarStatusSincronizacao(updates = {}) {
+  const pendingCount = await contarEventosPendentes();
+  const { [SYNC_STATUS_STORAGE_KEY]: previousStatus = {} } =
+    await chrome.storage.local.get(SYNC_STATUS_STORAGE_KEY);
+  const syncStatus = {
+    ...previousStatus,
+    ...updates,
+    pendingCount
+  };
+  await chrome.storage.local.set({ [SYNC_STATUS_STORAGE_KEY]: syncStatus });
+  return syncStatus;
+}
+
+async function enfileirarRequisicao({
+  clientEventId = criarIdEvento(),
+  endpoint,
+  method = "POST",
+  body
+}) {
+  const database = await abrirOutboxDatabase();
+  const transaction = database.transaction(
+    OUTBOX_STORE_NAME,
+    "readwrite",
+    { durability: "strict" }
+  );
+  const completion = aguardarTransacao(transaction);
+  const store = transaction.objectStore(OUTBOX_STORE_NAME);
+  const lookup = store.index("clientEventId").get(clientEventId);
+
+  lookup.onsuccess = () => {
+    const existing = lookup.result;
+    if (existing) {
+      store.put({
+        ...existing,
+        endpoint,
+        method,
+        body,
+        sortAt: body.started_at || existing.sortAt,
+        revision: existing.revision + 1,
+        attempts: 0,
+        nextAttemptAt: 0
+      });
+      return;
+    }
+
+    store.add({
+      clientEventId,
+      endpoint,
+      method,
+      body,
+      createdAt: new Date().toISOString(),
+      sortAt: body.started_at || new Date().toISOString(),
+      revision: 1,
+      attempts: 0,
+      nextAttemptAt: 0
+    });
+  };
+
+  await completion;
+  try {
+    await atualizarStatusSincronizacao();
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][sync] Evento persistido, mas não foi possível atualizar o status",
+      error
+    );
+  }
+  void sincronizarOutbox();
+  return clientEventId;
+}
+
+async function obterProximoEventoPendente() {
+  const database = await abrirOutboxDatabase();
+  const transaction = database.transaction(OUTBOX_STORE_NAME, "readonly");
+  const completion = aguardarTransacao(transaction);
+  const cursorRequest = transaction
+    .objectStore(OUTBOX_STORE_NAME)
+    .index("chronological")
+    .openCursor();
+  const event = await new Promise((resolve, reject) => {
+    cursorRequest.onsuccess = () =>
+      resolve(cursorRequest.result?.value || null);
+    cursorRequest.onerror = () =>
+      reject(cursorRequest.error || new Error("Falha ao ler o outbox."));
+  });
+  await completion;
+  return event;
+}
+
+async function removerEventoEnviado(event) {
+  const database = await abrirOutboxDatabase();
+  const transaction = database.transaction(
+    OUTBOX_STORE_NAME,
+    "readwrite",
+    { durability: "strict" }
+  );
+  const completion = aguardarTransacao(transaction);
+  const store = transaction.objectStore(OUTBOX_STORE_NAME);
+  const request = store.get(event.id);
+  request.onsuccess = () => {
+    if (request.result?.revision === event.revision) {
+      store.delete(event.id);
+    }
+  };
+  await completion;
+}
+
+async function registrarFalhaDeEnvio(event, error) {
+  const database = await abrirOutboxDatabase();
+  const transaction = database.transaction(
+    OUTBOX_STORE_NAME,
+    "readwrite",
+    { durability: "strict" }
+  );
+  const completion = aguardarTransacao(transaction);
+  const store = transaction.objectStore(OUTBOX_STORE_NAME);
+  const request = store.get(event.id);
+  request.onsuccess = () => {
+    const currentEvent = request.result;
+    if (!currentEvent || currentEvent.revision !== event.revision) {
+      return;
+    }
+
+    const attempts = currentEvent.attempts + 1;
+    const retryDelayMs = Math.min(5 * 60_000, 5_000 * 2 ** (attempts - 1));
+    store.put({
+      ...currentEvent,
+      attempts,
+      nextAttemptAt: Date.now() + retryDelayMs
+    });
+  };
+  await completion;
+  await atualizarStatusSincronizacao({
+    lastError: error.message || String(error),
+    lastErrorAt: new Date().toISOString()
+  });
+}
+
+async function enviarEventoPendente(event) {
+  const body = { ...event.body };
+  if (event.method === "POST" && !body.user_id) {
+    body.user_id = await obterUserIdPersistido();
+    if (!body.user_id) {
+      throw new Error("Identidade indisponível; evento mantido na fila.");
+    }
+  }
+
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/${event.endpoint}`,
+    {
+      method: event.method,
+      signal: AbortSignal.timeout(15_000),
+      headers: {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=representation"
+      },
+      body: JSON.stringify(body)
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Sincronização de ${event.endpoint} falhou: ${response.status} ${await response.text()}`
+    );
+  }
+}
+
+async function processarOutbox() {
+  while (true) {
+    const event = await obterProximoEventoPendente();
+    if (!event) {
+      await atualizarStatusSincronizacao();
+      return;
+    }
+
+    if (event.nextAttemptAt > Date.now()) {
+      return;
+    }
+
+    try {
+      await enviarEventoPendente(event);
+      await removerEventoEnviado(event);
+      await atualizarStatusSincronizacao({
+        lastSuccessAt: new Date().toISOString(),
+        lastError: null,
+        lastErrorAt: null
+      });
+    } catch (error) {
+      await registrarFalhaDeEnvio(event, error);
+      console.error(
+        "[Portal Extensão][sync] Evento mantido no outbox para nova tentativa",
+        { eventId: event.clientEventId, error: error.message }
+      );
+      return;
+    }
+  }
+}
+
+function sincronizarOutbox() {
+  synchronizationOperation = synchronizationOperation
+    .then(() => processarOutbox())
+    .catch((error) => {
+      console.error(
+        "[Portal Extensão][sync] Falha ao processar o outbox",
+        error
+      );
+    });
+  return synchronizationOperation;
+}
 
 function obterAplicacaoPrivada(url) {
   try {
@@ -285,6 +550,9 @@ const sessionReady = chrome.storage.local
       : null;
 
     if (currentSession) {
+      if (!Object.hasOwn(currentSession, "userId")) {
+        currentSession.userId = await obterUserIdPersistido();
+      }
       currentSession.titulo = obterTituloSeguro(
         currentSession.url,
         currentSession.titulo
@@ -314,7 +582,23 @@ const sessionReady = chrome.storage.local
       );
     }
 
-    await atualizarLimiteInatividade();
+    await abrirOutboxDatabase();
+    await chrome.alarms.create(OUTBOX_SYNC_ALARM, {
+      periodInMinutes: 1
+    });
+    if (
+      currentSession?.inactivityStartedAt &&
+      currentSession.inactivityClientEventId
+    ) {
+      await enviarEventoInatividade(
+        currentSession,
+        currentSession.inactivityStartedAt,
+        currentSession.inactivityEndedAt
+      );
+      await persistirSessao();
+    }
+    void sincronizarOutbox();
+    void atualizarLimiteInatividade();
     const settingsRefreshAlarm = await chrome.alarms.get(
       INACTIVITY_SETTINGS_REFRESH_ALARM
     );
@@ -330,7 +614,6 @@ const sessionReady = chrome.storage.local
   })
   .catch((error) => {
     console.error("Erro ao recuperar sessão ativa:", error);
-    currentSession = null;
   });
 
 function serializarOperacao(callback) {
@@ -421,6 +704,7 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
       empresa: info.empresa,
       aplicacao: info.aplicacao,
       categoria: info.categoria,
+      user_id: sessao.userId || null,
       titulo: obterTituloSeguro(sessao.url, sessao.titulo) || "",
       tab_title: obterTituloSeguro(sessao.url, sessao.titulo),
       window_title: obterTituloSeguro(sessao.url, sessao.windowTitle),
@@ -456,6 +740,7 @@ async function iniciarSessao(tab, startTime = Date.now()) {
   currentSession = {
     tabId: tab.id,
     url: tab.url,
+    userId: await obterUserIdPersistido(),
     titulo: obterTituloSeguro(tab.url, tab.title) || "",
     windowTitle: obterTituloSeguro(tab.url, tab.windowTitle),
     screenName: obterNomeTelaSeguro(tab.url, tab.screenName),
@@ -498,6 +783,21 @@ async function registrarTroca(tabId) {
     await iniciarSessao(tab);
   } catch (error) {
     console.error("Erro ao registrar troca de aba:", error);
+  }
+}
+
+async function registrarTrocaDeIdentidade(userId) {
+  if (!currentSession || currentSession.userId === userId) {
+    return;
+  }
+
+  const tabId = currentSession.tabId;
+  const timestamp = Date.now();
+  await encerrarSessao(timestamp, "identity_change");
+
+  const tab = await chrome.tabs.get(tabId);
+  if (tab.active && tab.url && !tab.url.startsWith("chrome://")) {
+    await iniciarSessao(tab, timestamp);
   }
 }
 
@@ -625,10 +925,15 @@ async function registrarInatividade(timestamp = Date.now()) {
 }
 
 async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
-  const userId = await obterUserId();
+  if (!sessao.inactivityClientEventId) {
+    sessao.inactivityClientEventId = criarIdEvento();
+  }
+  if (!Object.hasOwn(sessao, "inactivityUserId")) {
+    sessao.inactivityUserId = await obterUserIdPersistido();
+  }
+
   const startedAtIso = new Date(startedAt).toISOString();
   const endedAtIso = endedAt ? new Date(endedAt).toISOString() : null;
-  const createdAtIso = new Date().toISOString();
   const durationSeconds = endedAtIso
     ? Math.max(
         0,
@@ -639,34 +944,21 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
         )
       )
     : null;
-  const response = await fetch(
-    `${SUPABASE_URL}/rest/v1/inactivity_events`,
-    {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_KEY,
-        "Content-Type": "application/json",
-        "Prefer": "return=representation"
-      },
-      body: JSON.stringify({
-        user_id: userId,
-        started_at: startedAtIso,
-        ended_at: endedAtIso,
-        duration_seconds: durationSeconds,
-        classification: "inactive",
-        created_at: createdAtIso
-      })
+  await enfileirarRequisicao({
+    clientEventId: sessao.inactivityClientEventId,
+    endpoint: "inactivity_events?on_conflict=client_event_id",
+    body: {
+      client_event_id: sessao.inactivityClientEventId,
+      user_id: sessao.inactivityUserId,
+      started_at: startedAtIso,
+      ended_at: endedAtIso,
+      duration_seconds: durationSeconds,
+      classification: "inactive",
+      created_at: startedAtIso
     }
-  );
+  });
 
-  if (!response.ok) {
-    throw new Error(
-      `Criação de inactivity_event falhou: ${response.status} ${await response.text()}`
-    );
-  }
-
-  const rows = await response.json();
-  return rows?.[0]?.id ?? null;
+  return sessao.inactivityClientEventId;
 }
 
 async function criarEventoInatividade(startedAt) {
@@ -677,20 +969,15 @@ async function criarEventoInatividade(startedAt) {
   currentSession.inactivityStartedAt = new Date(startedAt).toISOString();
   currentSession.inactivityEndedAt = null;
   currentSession.inactivityEventId = null;
+  currentSession.inactivityClientEventId = criarIdEvento();
+  currentSession.inactivityUserId = await obterUserIdPersistido();
   await persistirSessao();
 
-  try {
-    currentSession.inactivityEventId = await enviarEventoInatividade(
-      currentSession,
-      currentSession.inactivityStartedAt
-    );
-    await persistirSessao();
-  } catch (error) {
-    console.error(
-      "[Portal Extensão][background] Falha ao criar inactivity_event",
-      error
-    );
-  }
+  await enviarEventoInatividade(
+    currentSession,
+    currentSession.inactivityStartedAt
+  );
+  await persistirSessao();
 }
 
 async function finalizarEventoInatividade(endedAt) {
@@ -711,77 +998,30 @@ async function finalizarEventoInatividade(endedAt) {
   currentSession.inactivityEndedAt = endedAtIso;
   await persistirSessao();
 
-  try {
-    const userId = await obterUserId();
-    let eventId = currentSession.inactivityEventId;
-
-    if (!eventId) {
-      const lookupResponse = await fetch(
-        `${SUPABASE_URL}/rest/v1/inactivity_events?user_id=eq.${encodeURIComponent(userId)}&started_at=eq.${encodeURIComponent(new Date(startedAt).toISOString())}&ended_at=is.null&select=id&order=created_at.desc&limit=1`,
-        {
-          headers: {
-            "apikey": SUPABASE_KEY
-          }
-        }
-      );
-
-      if (!lookupResponse.ok) {
-        throw new Error(
-          `Busca de inactivity_event aberto falhou: ${lookupResponse.status} ${await lookupResponse.text()}`
-        );
-      }
-
-      const openEvents = await lookupResponse.json();
-      eventId = openEvents?.[0]?.id ?? null;
+  if (currentSession.inactivityClientEventId || !currentSession.inactivityEventId) {
+    if (!currentSession.inactivityClientEventId) {
+      currentSession.inactivityClientEventId = criarIdEvento();
     }
-
-    if (eventId) {
-      const response = await fetch(
-        `${SUPABASE_URL}/rest/v1/inactivity_events?id=eq.${encodeURIComponent(eventId)}&user_id=eq.${encodeURIComponent(userId)}&ended_at=is.null`,
-        {
-          method: "PATCH",
-          headers: {
-            "apikey": SUPABASE_KEY,
-            "Content-Type": "application/json",
-            "Prefer": "return=representation"
-          },
-          body: JSON.stringify({
-            ended_at: endedAtIso,
-            duration_seconds: durationSeconds
-          })
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(
-          `Finalização de inactivity_event falhou: ${response.status} ${await response.text()}`
-        );
-      }
-
-      const updatedEvents = await response.json();
-      if (!updatedEvents?.length) {
-        throw new Error("Nenhum inactivity_event aberto foi atualizado.");
-      }
-    } else {
-      currentSession.inactivityEventId = await enviarEventoInatividade(
-        currentSession,
-        startedAt,
-        endedAtIso
-      );
-    }
-
-    currentSession.inactivityStartedAt = null;
-    currentSession.inactivityEndedAt = null;
-    currentSession.inactivityEventId = null;
     await persistirSessao();
-    return true;
-  } catch (error) {
-    console.error(
-      "[Portal Extensão][background] Falha ao finalizar inactivity_event",
-      error
-    );
-    return false;
+    await enviarEventoInatividade(currentSession, startedAt, endedAtIso);
+  } else {
+    await enfileirarRequisicao({
+      endpoint: `inactivity_events?id=eq.${encodeURIComponent(currentSession.inactivityEventId)}&ended_at=is.null`,
+      method: "PATCH",
+      body: {
+        ended_at: endedAtIso,
+        duration_seconds: durationSeconds
+      }
+    });
   }
+
+  currentSession.inactivityStartedAt = null;
+  currentSession.inactivityEndedAt = null;
+  currentSession.inactivityEventId = null;
+  currentSession.inactivityClientEventId = null;
+  currentSession.inactivityUserId = null;
+  await persistirSessao();
+  return true;
 }
 
 async function salvarIntervalo(sessao, inicio, fim, isActive) {
@@ -803,6 +1043,7 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
     empresa: info.empresa,
     aplicacao: info.aplicacao,
     categoria: info.categoria,
+    user_id: sessao.userId || null,
     titulo: obterTituloSeguro(sessao.url, sessao.titulo) || "",
     tab_title: obterTituloSeguro(sessao.url, sessao.titulo),
     window_title: obterTituloSeguro(sessao.url, sessao.windowTitle),
@@ -818,72 +1059,6 @@ async function salvarIntervalo(sessao, inicio, fim, isActive) {
   };
 
   await salvarRegistro(registro);
-}
-
-/**
- * Envia registro para o Supabase
- */
-async function enviarParaSupabase(registro) {
-  try {
-    const userId = await obterUserId();
-
-    console.info(
-      "[Portal Extensão][background] Enviando web_event",
-      {
-        user_id: userId,
-        domain: registro.hostname,
-        started_at: registro.inicio,
-        ended_at: registro.fim
-      }
-    );
-
-    const response = await fetch(
-      `${SUPABASE_URL}/rest/v1/web_events`,
-      {
-        method: "POST",
-        headers: {
-          "apikey": SUPABASE_KEY,
-          "Content-Type": "application/json",
-          "Prefer": "return=representation"
-        },
-        body: JSON.stringify({
-          user_id: userId,
-          domain: registro.hostname,
-          started_at: registro.inicio,
-          ended_at: registro.fim,
-          is_active: registro.is_active,
-          tab_title: registro.tab_title,
-          window_title: registro.window_title,
-          screen_name: registro.screen_name,
-          screen_context: registro.screen_context,
-          source: "chrome-extension"
-        })
-      }
-    );
-
-    if (!response.ok) {
-      const erro = await response.text();
-
-      console.error(
-        "❌ Erro Supabase:",
-        response.status,
-        erro
-      );
-
-      return;
-    }
-
-    console.log(
-      "✅ Enviado para Supabase:",
-      registro.hostname
-    );
-
-  } catch (error) {
-    console.error(
-      "❌ Falha ao enviar:",
-      error
-    );
-  }
 }
 
 /**
@@ -1115,26 +1290,46 @@ function obterDadosUrl(url) {
 }
 
 /**
- * Salva localmente e envia ao Supabase
+ * Persiste o evento no outbox antes de iniciar qualquer sincronização.
  */
 async function salvarRegistro(registro) {
+  const clientEventId = criarIdEvento();
+  await enfileirarRequisicao({
+    clientEventId,
+    endpoint: "web_events?on_conflict=client_event_id",
+    body: {
+      client_event_id: clientEventId,
+      user_id: registro.user_id ?? await obterUserIdPersistido(),
+      domain: registro.hostname,
+      started_at: registro.inicio,
+      ended_at: registro.fim,
+      is_active: registro.is_active,
+      tab_title: registro.tab_title,
+      window_title: registro.window_title,
+      screen_name: registro.screen_name,
+      screen_context: registro.screen_context,
+      source: "chrome-extension"
+    }
+  });
+
   try {
     const storage = await chrome.storage.local.get("registros");
-
     const registros = storage.registros || [];
-
-    registros.push(registro);
-
-    await chrome.storage.local.set({
-      registros
+    registros.push({
+      domain: registro.hostname,
+      duracaoSegundos: registro.duracaoSegundos,
+      started_at: registro.inicio,
+      screen_name: registro.screen_name,
+      screen_context: registro.screen_context
     });
-
-    console.log("Registro salvo:", registro);
-
-    await enviarParaSupabase(registro);
-
+    await chrome.storage.local.set({
+      registros: registros.slice(-100)
+    });
   } catch (error) {
-    console.error("Erro ao salvar:", error);
+    console.error(
+      "[Portal Extensão][sync] Evento está no outbox, mas o histórico recente não foi atualizado",
+      error
+    );
   }
 }
 
@@ -1195,6 +1390,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === OUTBOX_SYNC_ALARM) {
+    void sincronizarOutbox();
+    return;
+  }
+
   if (alarm.name === INACTIVITY_SETTINGS_REFRESH_ALARM) {
     void serializarOperacao(() => atualizarLimiteInatividade());
     return;
@@ -1316,29 +1516,29 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
-    console.info(
-      "[Portal Extensão][background] Iniciando gravação no chrome.storage.local",
-      {
-        operation:
-          userId === null ? "remove" : "set",
-        userId
-      }
-    );
+    if (userId === null) {
+      sendResponse({
+        ok: true,
+        stage: "unchanged",
+        userId: null
+      });
+      return;
+    }
 
-    const operation =
-      userId === null
-        ? chrome.storage.local.remove("portalUserId")
-        : chrome.storage.local.set({
-            portalUserId: userId
+    void chrome.storage.local
+      .get("portalUserId")
+      .then(async ({ portalUserId }) => {
+        if (portalUserId === userId) {
+          sendResponse({
+            ok: true,
+            stage: "unchanged"
           });
+          return;
+        }
 
-    void operation
-      .then(async () => {
+        await chrome.storage.local.set({ portalUserId: userId });
         const stored = await chrome.storage.local.get("portalUserId");
-        const persisted =
-          userId === null
-            ? !Object.hasOwn(stored, "portalUserId")
-            : stored.portalUserId === userId;
+        const persisted = stored.portalUserId === userId;
 
         if (!persisted) {
           console.error(
@@ -1354,8 +1554,12 @@ chrome.runtime.onMessage.addListener(
         console.info(
           "[Portal Extensão][background] Identidade persistida e verificada",
           {
-            userId: userId === null ? null : stored.portalUserId
+            userId: stored.portalUserId
           }
+        );
+        void sincronizarOutbox();
+        void serializarOperacao(() =>
+          registrarTrocaDeIdentidade(userId)
         );
         sendResponse({
           ok: true,
@@ -1364,7 +1568,7 @@ chrome.runtime.onMessage.addListener(
       })
       .catch((error) => {
         console.error(
-          "[Portal Extensão][background] Erro ao atualizar chrome.storage.local",
+          "[Portal Extensão][background] Erro ao verificar ou persistir identidade",
           error
         );
         sendResponse({
@@ -1381,7 +1585,8 @@ console.info(
   "[Portal Extensão][background] Listener PORTAL_IDENTITY_CHANGED registrado",
   {
     event: "PORTAL_IDENTITY_CHANGED",
-    storage: "chrome.storage.local"
+    storage: "chrome.storage.local",
+    retainsIdentityWhenUnavailable: true
   }
 );
 

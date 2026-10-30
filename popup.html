@@ -19,12 +19,20 @@
       border-bottom: 1px solid #ddd;
       padding: 8px 0;
     }
+
+    #sync-status {
+      margin-bottom: 12px;
+      padding: 8px;
+      background: #f3f3f3;
+      overflow-wrap: anywhere;
+    }
   </style>
 </head>
 <body>
 
   <h2>Portal Produtividade</h2>
 
+  <section id="sync-status" aria-live="polite"></section>
   <div id="lista"></div>
 
   <script src="popup.js"></script>

@@ -19,3 +19,16 @@ campos `screen_name` e `screen_context` de `web_events`. A migração em
 conversa e e-mail reconhecidas (Copilot, ChatGPT, Claude, Gemini, WhatsApp,
 Teams, Outlook, Gmail, Slack e Discord), os títulos são substituídos pelo nome
 do aplicativo e o contexto da tela não é coletado.
+
+Todos os `web_events` e `inactivity_events` são gravados primeiro em um outbox
+persistente do IndexedDB da extensão. A sincronização envia um evento por vez,
+na ordem de captura, e só o remove após uma resposta de sucesso. Falhas de rede,
+indisponibilidade do Supabase ou ausência de identidade mantêm os eventos na
+fila para novas tentativas. O alarme periódico retoma o envio após reiniciar o
+navegador; IDs idempotentes e a migration
+`20261030140000_add_client_event_ids.sql` evitam duplicações no servidor.
+
+A última identidade autenticada permanece em `chrome.storage.local` quando o
+portal está fechado ou não consegue informar uma sessão; eventos já enfileirados
+mantêm a identidade que tinham no momento da captura. O popup mostra a contagem
+de eventos pendentes, o último envio bem-sucedido e o último erro.

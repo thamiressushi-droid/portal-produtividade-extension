@@ -44,6 +44,10 @@
   }
 
   function notifyBackground(userId) {
+    if (!userId) {
+      return;
+    }
+
     if (userId === lastReportedUserId) {
       return;
     }
@@ -124,11 +128,6 @@
       return;
     }
 
-    if (userId === null) {
-      notifyBackground(null);
-      return;
-    }
-
     if (typeof userId !== "string" || !userId.trim()) {
       console.error(
         "[Portal Extensão][content] Identidade ignorada: userId inválido",
@@ -152,26 +151,24 @@
     sendResponse({ userId });
   });
 
-  function refreshAuthIdentity(clearIfMissing = false) {
+  function refreshAuthIdentity() {
     const userId = getAuthUserId();
     if (userId) {
       notifyBackground(userId);
-    } else if (clearIfMissing) {
-      notifyBackground(null);
     }
   }
 
   refreshAuthIdentity();
   window.addEventListener("storage", (event) => {
     if (event.key === supabaseAuthStorageKey) {
-      refreshAuthIdentity(event.newValue === null);
+      refreshAuthIdentity();
     }
   });
-  window.addEventListener("focus", () => refreshAuthIdentity(true));
-  window.addEventListener("pageshow", () => refreshAuthIdentity(true));
+  window.addEventListener("focus", refreshAuthIdentity);
+  window.addEventListener("pageshow", refreshAuthIdentity);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      refreshAuthIdentity(true);
+      refreshAuthIdentity();
     }
   });
 })();
