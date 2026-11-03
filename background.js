@@ -1801,6 +1801,51 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
+const LIMITE_PERIODO_OCIOSO_SEGUNDOS = 14400;
+
+chrome.idle.onStateChanged.addListener(async (state) => {
+  try {
+    const { inicioOciosidade } =
+      await chrome.storage.local.get("inicioOciosidade");
+
+    if (state === "idle" && inicioOciosidade === undefined) {
+      await chrome.storage.local.set({
+        inicioOciosidade:
+          Date.now() - ((inactivityThresholdSeconds ?? 60) * 1000)
+      });
+      return;
+    }
+
+    if (state === "locked" && inicioOciosidade === undefined) {
+      await chrome.storage.local.set({ inicioOciosidade: Date.now() });
+      return;
+    }
+
+    if (state === "active" && inicioOciosidade !== undefined) {
+      await chrome.storage.local.remove("inicioOciosidade");
+      const fim = Date.now();
+      const duracaoSegundos = Math.floor((fim - inicioOciosidade) / 1000);
+
+      if (duracaoSegundos > LIMITE_PERIODO_OCIOSO_SEGUNDOS) {
+        console.warn(
+          "[Portal Extensão][background] Período ocioso descartado (acima do limite)",
+          { inicio: inicioOciosidade, fim, duracaoSegundos }
+        );
+      } else {
+        console.log(
+          "[Portal Extensão][background] Período ocioso detectado",
+          { inicio: inicioOciosidade, fim, duracaoSegundos }
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][background] Falha ao registrar período ocioso",
+      error
+    );
+  }
+});
+
 chrome.idle.onStateChanged.addListener((state) => {
   if (
     (state !== "idle" && state !== "locked") ||
@@ -1820,6 +1865,15 @@ chrome.idle.onStateChanged.addListener((state) => {
 
 chrome.runtime.onStartup.addListener(() => {
   void serializarOperacao(async () => {
+    try {
+      await chrome.storage.local.remove("inicioOciosidade");
+    } catch (error) {
+      console.error(
+        "[Portal Extensão][background] Falha ao limpar início da ociosidade na inicialização",
+        error
+      );
+    }
+
     if (!currentSession) {
       return;
     }
