@@ -303,6 +303,7 @@ async function obterUserId() {
 const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
 const INACTIVITY_SETTINGS_REFRESH_ALARM = "portal-inactivity-settings-refresh";
 const INACTIVITY_ALARM = "portal-session-inactivity";
+const MAX_INACTIVE_EVENT_SECONDS = 14400;
 const PRIVATE_APPLICATIONS = [
   {
     name: "Copilot",
@@ -706,18 +707,6 @@ async function processarOutbox() {
 
     if (event.nextAttemptAt > Date.now()) {
       return;
-    }
-
-    if (
-      event.endpoint?.split("?")[0] === "web_events" &&
-      event.body?.is_active === false
-    ) {
-      console.warn(
-        "[Portal Extensão][sync] Evento web_events inativo descartado; períodos inativos são registrados separadamente",
-        { eventId: event.clientEventId }
-      );
-      await removerEventoEnviado(event);
-      continue;
     }
 
     try {
@@ -1227,18 +1216,28 @@ async function restaurarEventoInatividadeSessao() {
 }
 
 async function agendarEncerramento() {
-  if (
-    !currentSession ||
-    !currentSession.isActive ||
-    inactivityThresholdSeconds === null
-  ) {
+  if (!currentSession) {
     await chrome.alarms.clear(INACTIVITY_ALARM);
     return;
   }
 
-  const deadline =
-    new Date(currentSession.lastActivity).getTime() +
-    inactivityThresholdSeconds * 1000;
+  let deadline;
+  if (currentSession.isActive) {
+    if (inactivityThresholdSeconds === null) {
+      await chrome.alarms.clear(INACTIVITY_ALARM);
+      return;
+    }
+
+    deadline =
+      new Date(currentSession.lastActivity).getTime() +
+      inactivityThresholdSeconds * 1000;
+  } else {
+    const inactivityStartedAt =
+      currentSession.inactivityStartedAt || currentSession.intervalStart;
+    deadline =
+      new Date(inactivityStartedAt).getTime() +
+      MAX_INACTIVE_EVENT_SECONDS * 1000;
+  }
 
   await chrome.alarms.create(INACTIVITY_ALARM, {
     when: deadline
@@ -1264,8 +1263,19 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
   const inicioIntervalo = new Date(
     sessao.intervalStart || sessao.inicio
   ).getTime();
-  const fim = Math.max(inicioIntervalo, endTime);
+  const inactivityStartedAt = new Date(
+    sessao.inactivityStartedAt || inicioIntervalo
+  ).getTime();
+  const inactiveDeadline =
+    inactivityStartedAt + MAX_INACTIVE_EVENT_SECONDS * 1000;
+  const fim = Math.max(
+    inicioIntervalo,
+    sessao.isActive ? endTime : Math.min(endTime, inactiveDeadline)
+  );
   const duracaoSegundos = Math.floor((fim - inicioIntervalo) / 1000);
+  const inactiveDurationSeconds = Math.floor(
+    (endTime - inicioIntervalo) / 1000
+  );
   const dados = obterDadosUrl(sessao.url);
 
   console.info(
@@ -1283,7 +1293,11 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     }
   );
 
-  if (duracaoSegundos >= 5 && sessao.isActive) {
+  if (
+    duracaoSegundos >= 5 &&
+    (sessao.isActive ||
+      inactiveDurationSeconds <= MAX_INACTIVE_EVENT_SECONDS)
+  ) {
     const info = identificarAplicacao(sessao.url, dados.hostname);
     const registro = {
       url: dados.url,
@@ -1309,6 +1323,16 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     };
 
     await salvarRegistro(registro);
+  } else if (!sessao.isActive) {
+    console.warn(
+      "[Portal Extensão][background] Período inativo excedeu o limite de registro e foi descartado",
+      {
+        startedAt: new Date(inicioIntervalo).toISOString(),
+        endTime: new Date(endTime).toISOString(),
+        maxDurationSeconds: MAX_INACTIVE_EVENT_SECONDS,
+        reason
+      }
+    );
   }
 
   if (currentSession?.inactivityStartedAt) {
@@ -1528,7 +1552,7 @@ async function registrarInatividade(timestamp = Date.now()) {
   currentSession.isActive = false;
   await persistirSessao();
   await criarEventoInatividade(currentSession.intervalStart);
-  await chrome.alarms.clear(INACTIVITY_ALARM);
+  await agendarEncerramento();
 
   console.info(
     "[Portal Extensão][background] Inatividade detectada",
@@ -1545,7 +1569,46 @@ async function retomarSessaoAposInatividade(timestamp, reason) {
     return;
   }
 
-  const finalized = await finalizarEventoInatividade(timestamp);
+  const inactivityStartedAt = new Date(
+    currentSession.inactivityStartedAt || currentSession.intervalStart
+  ).getTime();
+  const inactiveDeadline =
+    inactivityStartedAt + MAX_INACTIVE_EVENT_SECONDS * 1000;
+  const inactivityEndedAt = Math.min(timestamp, inactiveDeadline);
+  const inactiveDurationSeconds = Math.floor(
+    (timestamp - inactivityStartedAt) / 1000
+  );
+
+  if (
+    inactiveDurationSeconds <= MAX_INACTIVE_EVENT_SECONDS &&
+    inactivityEndedAt - inactivityStartedAt >= 5000
+  ) {
+    try {
+      await salvarIntervalo(
+        currentSession,
+        inactivityStartedAt,
+        inactivityEndedAt,
+        false
+      );
+    } catch (error) {
+      console.error(
+        "[Portal Extensão][background] Falha ao salvar o intervalo inativo",
+        error
+      );
+    }
+  } else if (inactiveDurationSeconds > MAX_INACTIVE_EVENT_SECONDS) {
+    console.warn(
+      "[Portal Extensão][background] Período inativo excedeu o limite de registro e foi descartado",
+      {
+        startedAt: new Date(inactivityStartedAt).toISOString(),
+        endTime: new Date(timestamp).toISOString(),
+        maxDurationSeconds: MAX_INACTIVE_EVENT_SECONDS,
+        reason
+      }
+    );
+  }
+
+  const finalized = await finalizarEventoInatividade(inactivityEndedAt);
   if (!finalized) {
     console.warn(
       "[Portal Extensão][background] Sessão retomada com encerramento de inatividade pendente; será tentado novamente",
@@ -1572,10 +1635,15 @@ async function processarEstadoIdle(state, timestamp = Date.now()) {
       currentSession?.isActive &&
       inactivityThresholdSeconds !== null
     ) {
-      const deadline =
-        new Date(currentSession.lastActivity).getTime() +
-        inactivityThresholdSeconds * 1000;
-      if (timestamp >= deadline) {
+      if (
+        inactivityThresholdSeconds !== null &&
+        timestamp >=
+          new Date(currentSession.lastActivity).getTime() +
+            inactivityThresholdSeconds * 1000
+      ) {
+        const deadline =
+          new Date(currentSession.lastActivity).getTime() +
+          inactivityThresholdSeconds * 1000;
         await registrarInatividade(deadline);
       }
     }
@@ -2091,18 +2159,6 @@ function obterDadosUrl(url) {
  * Persiste o evento no outbox antes de iniciar qualquer sincronização.
  */
 async function salvarRegistro(registro) {
-  if (registro.is_active !== true) {
-    console.warn(
-      "[Portal Extensão][background] Registro web_events inativo ignorado; períodos inativos não compõem uso de ferramentas",
-      {
-        domain: obterDadosUrl(registro.url).hostname,
-        inicio: registro.inicio,
-        fim: registro.fim
-      }
-    );
-    return;
-  }
-
   const clientEventId = criarIdEvento();
   const body = {
     client_event_id: clientEventId,
@@ -2221,7 +2277,27 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   void serializarOperacao(async () => {
-    if (!currentSession || inactivityThresholdSeconds === null) {
+    if (!currentSession) {
+      return;
+    }
+
+    if (!currentSession.isActive) {
+      const inactivityStartedAt = new Date(
+        currentSession.inactivityStartedAt || currentSession.intervalStart
+      ).getTime();
+      const inactiveDeadline =
+        inactivityStartedAt + MAX_INACTIVE_EVENT_SECONDS * 1000;
+
+      if (Date.now() < inactiveDeadline) {
+        await agendarEncerramento();
+        return;
+      }
+
+      await encerrarSessao(inactiveDeadline, "inactive_timeout");
+      return;
+    }
+
+    if (inactivityThresholdSeconds === null) {
       return;
     }
 
