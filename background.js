@@ -303,7 +303,6 @@ async function obterUserId() {
 const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
 const INACTIVITY_SETTINGS_REFRESH_ALARM = "portal-inactivity-settings-refresh";
 const INACTIVITY_ALARM = "portal-session-inactivity";
-const MAX_INACTIVE_EVENT_SECONDS = 14400;
 const PRIVATE_APPLICATIONS = [
   {
     name: "Copilot",
@@ -1216,28 +1215,18 @@ async function restaurarEventoInatividadeSessao() {
 }
 
 async function agendarEncerramento() {
-  if (!currentSession) {
+  if (
+    !currentSession ||
+    !currentSession.isActive ||
+    inactivityThresholdSeconds === null
+  ) {
     await chrome.alarms.clear(INACTIVITY_ALARM);
     return;
   }
 
-  let deadline;
-  if (currentSession.isActive) {
-    if (inactivityThresholdSeconds === null) {
-      await chrome.alarms.clear(INACTIVITY_ALARM);
-      return;
-    }
-
-    deadline =
-      new Date(currentSession.lastActivity).getTime() +
-      inactivityThresholdSeconds * 1000;
-  } else {
-    const inactivityStartedAt =
-      currentSession.inactivityStartedAt || currentSession.intervalStart;
-    deadline =
-      new Date(inactivityStartedAt).getTime() +
-      MAX_INACTIVE_EVENT_SECONDS * 1000;
-  }
+  const deadline =
+    new Date(currentSession.lastActivity).getTime() +
+    inactivityThresholdSeconds * 1000;
 
   await chrome.alarms.create(INACTIVITY_ALARM, {
     when: deadline
@@ -1263,19 +1252,8 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
   const inicioIntervalo = new Date(
     sessao.intervalStart || sessao.inicio
   ).getTime();
-  const inactivityStartedAt = new Date(
-    sessao.inactivityStartedAt || inicioIntervalo
-  ).getTime();
-  const inactiveDeadline =
-    inactivityStartedAt + MAX_INACTIVE_EVENT_SECONDS * 1000;
-  const fim = Math.max(
-    inicioIntervalo,
-    sessao.isActive ? endTime : Math.min(endTime, inactiveDeadline)
-  );
+  const fim = Math.max(inicioIntervalo, endTime);
   const duracaoSegundos = Math.floor((fim - inicioIntervalo) / 1000);
-  const inactiveDurationSeconds = Math.floor(
-    (endTime - inicioIntervalo) / 1000
-  );
   const dados = obterDadosUrl(sessao.url);
 
   console.info(
@@ -1293,11 +1271,7 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     }
   );
 
-  if (
-    duracaoSegundos >= 5 &&
-    (sessao.isActive ||
-      inactiveDurationSeconds <= MAX_INACTIVE_EVENT_SECONDS)
-  ) {
+  if (duracaoSegundos >= 5) {
     const info = identificarAplicacao(sessao.url, dados.hostname);
     const registro = {
       url: dados.url,
@@ -1323,16 +1297,6 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     };
 
     await salvarRegistro(registro);
-  } else if (!sessao.isActive) {
-    console.warn(
-      "[Portal Extensão][background] Período inativo excedeu o limite de registro e foi descartado",
-      {
-        startedAt: new Date(inicioIntervalo).toISOString(),
-        endTime: new Date(endTime).toISOString(),
-        maxDurationSeconds: MAX_INACTIVE_EVENT_SECONDS,
-        reason
-      }
-    );
   }
 
   if (currentSession?.inactivityStartedAt) {
@@ -1365,7 +1329,7 @@ async function iniciarSessao(tab, startTime = Date.now()) {
   };
 
   await persistirSessao();
-  await agendarEncerramento();
+  await chrome.alarms.clear(INACTIVITY_ALARM);
 
   const dadosAtuais = obterDadosUrl(tab.url);
   console.info(
@@ -1552,7 +1516,7 @@ async function registrarInatividade(timestamp = Date.now()) {
   currentSession.isActive = false;
   await persistirSessao();
   await criarEventoInatividade(currentSession.intervalStart);
-  await agendarEncerramento();
+  await chrome.alarms.clear(INACTIVITY_ALARM);
 
   console.info(
     "[Portal Extensão][background] Inatividade detectada",
@@ -1569,46 +1533,14 @@ async function retomarSessaoAposInatividade(timestamp, reason) {
     return;
   }
 
-  const inactivityStartedAt = new Date(
-    currentSession.inactivityStartedAt || currentSession.intervalStart
-  ).getTime();
-  const inactiveDeadline =
-    inactivityStartedAt + MAX_INACTIVE_EVENT_SECONDS * 1000;
-  const inactivityEndedAt = Math.min(timestamp, inactiveDeadline);
-  const inactiveDurationSeconds = Math.floor(
-    (timestamp - inactivityStartedAt) / 1000
+  await salvarIntervalo(
+    currentSession,
+    currentSession.intervalStart,
+    timestamp,
+    false
   );
 
-  if (
-    inactiveDurationSeconds <= MAX_INACTIVE_EVENT_SECONDS &&
-    inactivityEndedAt - inactivityStartedAt >= 5000
-  ) {
-    try {
-      await salvarIntervalo(
-        currentSession,
-        inactivityStartedAt,
-        inactivityEndedAt,
-        false
-      );
-    } catch (error) {
-      console.error(
-        "[Portal Extensão][background] Falha ao salvar o intervalo inativo",
-        error
-      );
-    }
-  } else if (inactiveDurationSeconds > MAX_INACTIVE_EVENT_SECONDS) {
-    console.warn(
-      "[Portal Extensão][background] Período inativo excedeu o limite de registro e foi descartado",
-      {
-        startedAt: new Date(inactivityStartedAt).toISOString(),
-        endTime: new Date(timestamp).toISOString(),
-        maxDurationSeconds: MAX_INACTIVE_EVENT_SECONDS,
-        reason
-      }
-    );
-  }
-
-  const finalized = await finalizarEventoInatividade(inactivityEndedAt);
+  const finalized = await finalizarEventoInatividade(timestamp);
   if (!finalized) {
     console.warn(
       "[Portal Extensão][background] Sessão retomada com encerramento de inatividade pendente; será tentado novamente",
@@ -1633,19 +1565,15 @@ async function processarEstadoIdle(state, timestamp = Date.now()) {
   if (state === "active") {
     if (
       currentSession?.isActive &&
-      inactivityThresholdSeconds !== null
+      inactivityThresholdSeconds !== null &&
+      timestamp >=
+        new Date(currentSession.lastActivity).getTime() +
+          inactivityThresholdSeconds * 1000
     ) {
-      if (
-        inactivityThresholdSeconds !== null &&
-        timestamp >=
-          new Date(currentSession.lastActivity).getTime() +
-            inactivityThresholdSeconds * 1000
-      ) {
-        const deadline =
-          new Date(currentSession.lastActivity).getTime() +
-          inactivityThresholdSeconds * 1000;
-        await registrarInatividade(deadline);
-      }
+      const deadline =
+        new Date(currentSession.lastActivity).getTime() +
+        inactivityThresholdSeconds * 1000;
+      await registrarInatividade(deadline);
     }
 
     await retomarSessaoAposInatividade(timestamp, "system_active");
@@ -2277,23 +2205,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   void serializarOperacao(async () => {
-    if (!currentSession) {
-      return;
-    }
-
-    if (!currentSession.isActive) {
-      const inactivityStartedAt = new Date(
-        currentSession.inactivityStartedAt || currentSession.intervalStart
-      ).getTime();
-      const inactiveDeadline =
-        inactivityStartedAt + MAX_INACTIVE_EVENT_SECONDS * 1000;
-
-      if (Date.now() < inactiveDeadline) {
-        await agendarEncerramento();
-        return;
-      }
-
-      await encerrarSessao(inactiveDeadline, "inactive_timeout");
+    if (!currentSession || !currentSession.isActive) {
       return;
     }
 

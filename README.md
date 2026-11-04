@@ -4,14 +4,10 @@ Plugin do navegador
 Os intervalos de navegação são registrados em `web_events`, com `is_active`
 distinguindo uso ativo de períodos inativos. Ao atingir o limite de inatividade,
 a extensão encerra o intervalo ativo e abre um evento separado em
-`inactivity_events`; o intervalo inativo é gravado em `web_events` quando a
-sessão retoma ou encerra. Períodos inativos acima de quatro horas não são
-incluídos em `web_events`, e o evento de inatividade é fechado no limite de
-quatro horas. A extensão também fecha o evento ao detectar retorno do sistema
-ou na próxima interação. Na inicialização, consulta o estado atual do sistema
-para reconciliar eventos pendentes. O dashboard deve filtrar `is_active = true`
-ao calcular uso de ferramentas. O limite de inatividade é lido da tabela
-`settings`, na chave
+`inactivity_events`; ao retomar ou encerrar a sessão, registra o intervalo
+inativo em `web_events` e finaliza o evento de inatividade. A inicialização
+restaura sessões e eventos pendentes e reconcilia o estado atual do sistema.
+O limite de inatividade é lido da tabela `settings`, na chave
 `inactivity_threshold_minutes`, e atualizado periodicamente. O último limite
 válido fica em cache local para uso temporário se o Supabase estiver
 indisponível. Uma sessão pendente é recuperada sem contabilizar o período em que
