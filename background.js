@@ -454,13 +454,26 @@ async function enfileirarRequisicao({
   lookup.onsuccess = () => {
     const existing = lookup.result;
     if (existing) {
+      const isInactivityEvent =
+        endpoint.split("?")[0] === "inactivity_events" &&
+        existing.endpoint.split("?")[0] === "inactivity_events";
+      const existingBody = existing.body || {};
+      const mergedBody = isInactivityEvent
+        ? {
+            ...existingBody,
+            ...requestBody,
+            started_at: requestBody.started_at ?? existingBody.started_at,
+            ended_at: requestBody.ended_at ?? existingBody.ended_at
+          }
+        : requestBody;
+
       store.put({
         ...existing,
         endpoint,
         method,
-        body: requestBody,
-        sortAt: requestBody.started_at || existing.sortAt,
-        revision: existing.revision + 1,
+        body: mergedBody,
+        sortAt: mergedBody.started_at || existing.sortAt,
+        revision: (existing.revision || 0) + 1,
         attempts: 0,
         nextAttemptAt: 0
       });
@@ -695,6 +708,18 @@ async function processarOutbox() {
       return;
     }
 
+    if (
+      event.endpoint?.split("?")[0] === "web_events" &&
+      event.body?.is_active === false
+    ) {
+      console.warn(
+        "[Portal Extensão][sync] Evento web_events inativo descartado; períodos inativos são registrados separadamente",
+        { eventId: event.clientEventId }
+      );
+      await removerEventoEnviado(event);
+      continue;
+    }
+
     try {
       await enviarEventoPendente(event);
       await removerEventoEnviado(event);
@@ -873,6 +898,17 @@ async function atualizarLimiteInatividade() {
       );
     }
 
+    if (currentSession && !currentSession.isActive) {
+      try {
+        await processarEstadoIdle(await consultarEstadoIdle());
+      } catch (error) {
+        console.error(
+          "[Portal Extensão][background] Falha ao reconciliar a sessão após atualizar o limite de inatividade",
+          error
+        );
+      }
+    }
+
     console.info(
       "[Portal Extensão][background] Limite de inatividade atualizado",
       { minutes: Number(value) }
@@ -932,7 +968,6 @@ const sessionReady = chrome.storage.local
         currentSession.url,
         currentSession.screenContext
       );
-      await persistirSessao();
     }
 
     const cachedThreshold = converterLimiteInatividade(
@@ -949,15 +984,18 @@ const sessionReady = chrome.storage.local
     await chrome.alarms.create(OUTBOX_SYNC_ALARM, {
       periodInMinutes: 1
     });
-    if (
-      currentSession?.inactivityStartedAt &&
-      currentSession.inactivityClientEventId
-    ) {
-      await enviarEventoInatividade(
-        currentSession,
-        currentSession.inactivityStartedAt,
-        currentSession.inactivityEndedAt
-      );
+    if (currentSession) {
+      await restaurarEventoInatividadeSessao();
+      if (!currentSession.isActive) {
+        try {
+          await processarEstadoIdle(await consultarEstadoIdle());
+        } catch (error) {
+          console.error(
+            "[Portal Extensão][background] Não foi possível reconciliar a sessão com o estado atual do sistema",
+            error
+          );
+        }
+      }
       await persistirSessao();
     }
     void sincronizarOutbox();
@@ -999,6 +1037,193 @@ async function persistirSessao() {
   }
 
   await chrome.storage.local.remove("activeSession");
+}
+
+async function recuperarEventoInatividadeDoOutbox({
+  clientEventId = null,
+  startedAt = null,
+  userId = null
+} = {}) {
+  try {
+    const database = await abrirOutboxDatabase();
+    const transaction = database.transaction(OUTBOX_STORE_NAME, "readonly");
+    const completion = aguardarTransacao(transaction);
+    const request = transaction.objectStore(OUTBOX_STORE_NAME).getAll();
+    const events = await new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () =>
+        reject(request.error || new Error("Falha ao consultar o outbox."));
+    });
+    await completion;
+
+    const matches = events.filter((event) => {
+      if (event.endpoint?.split("?")[0] !== "inactivity_events") {
+        return false;
+      }
+
+      const body = event.body || {};
+      if (clientEventId) {
+        return (
+          event.clientEventId === clientEventId ||
+          body.client_event_id === clientEventId
+        );
+      }
+
+      return (
+        startedAt &&
+        body.started_at === new Date(startedAt).toISOString() &&
+        (!userId || body.user_id === userId)
+      );
+    });
+    const distinctIds = [...new Set(matches.map((event) =>
+      event.body?.client_event_id || event.clientEventId
+    ).filter(Boolean))];
+
+    if (distinctIds.length !== 1) {
+      if (distinctIds.length > 1) {
+        console.error(
+          "[Portal Extensão][background] Recuperação de inatividade ambígua no outbox",
+          { startedAt, clientEventId, matchCount: distinctIds.length }
+        );
+      }
+      return null;
+    }
+
+    return matches.find((event) =>
+      (event.body?.client_event_id || event.clientEventId) === distinctIds[0]
+    ) || null;
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][background] Falha ao recuperar inatividade do outbox",
+      error
+    );
+    return null;
+  }
+}
+
+async function restaurarEventoInatividadeSessao() {
+  if (!currentSession) {
+    return;
+  }
+
+  const session = currentSession;
+  let hasStartedAt = Boolean(session.inactivityStartedAt);
+  let hasClientEventId = Boolean(session.inactivityClientEventId);
+  let hasServerEventId = Boolean(session.inactivityEventId);
+  let hasInactivityMetadata =
+    hasStartedAt ||
+    hasClientEventId ||
+    hasServerEventId ||
+    Boolean(session.inactivityEndedAt);
+
+  if (
+    hasInactivityMetadata &&
+    !hasServerEventId &&
+    (!hasStartedAt || !hasClientEventId)
+  ) {
+    const pendingEvent = await recuperarEventoInatividadeDoOutbox({
+      clientEventId: session.inactivityClientEventId || null,
+      startedAt: session.inactivityStartedAt || null,
+      userId: session.inactivityUserId || session.userId || null
+    });
+
+    if (pendingEvent) {
+      const pendingBody = pendingEvent.body || {};
+      const pendingClientEventId =
+        pendingBody.client_event_id || pendingEvent.clientEventId;
+      if (
+        !session.inactivityClientEventId ||
+        session.inactivityClientEventId === pendingClientEventId
+      ) {
+        session.inactivityClientEventId = pendingClientEventId;
+        session.inactivityStartedAt =
+          session.inactivityStartedAt || pendingBody.started_at || null;
+        session.inactivityEndedAt =
+          session.inactivityEndedAt || pendingBody.ended_at || null;
+        session.inactivityUserId =
+          session.inactivityUserId || pendingBody.user_id || null;
+      } else {
+        console.error(
+          "[Portal Extensão][background] ID do evento no outbox diverge da sessão; a referência local foi preservada",
+          {
+            sessionClientEventId: session.inactivityClientEventId,
+            outboxClientEventId: pendingClientEventId
+          }
+        );
+      }
+    }
+  }
+
+  hasStartedAt = Boolean(session.inactivityStartedAt);
+  hasClientEventId = Boolean(session.inactivityClientEventId);
+  hasServerEventId = Boolean(session.inactivityEventId);
+  hasInactivityMetadata =
+    hasStartedAt ||
+    hasClientEventId ||
+    hasServerEventId ||
+    Boolean(session.inactivityEndedAt);
+
+  if (!hasInactivityMetadata) {
+    if (!session.isActive) {
+      console.warn(
+        "[Portal Extensão][background] Sessão restaurada como IDLE sem referência de evento; retornando para ACTIVE",
+        { tabId: session.tabId }
+      );
+      session.isActive = true;
+      session.intervalStart = new Date().toISOString();
+      session.lastActivity = session.intervalStart;
+    }
+    return;
+  }
+
+  if (session.inactivityEndedAt) {
+    session.isActive = true;
+    await finalizarEventoInatividade(
+      new Date(session.inactivityEndedAt).getTime()
+    );
+    return;
+  }
+
+  if (hasStartedAt && (hasClientEventId || hasServerEventId)) {
+    // O marcador local do evento é autoritativo durante a restauração.
+    // A próxima interação encerrará o evento; o ID não é regenerado.
+    session.isActive = false;
+    if (hasClientEventId) {
+      try {
+        await enviarEventoInatividade(
+          session,
+          session.inactivityStartedAt,
+          null
+        );
+      } catch (error) {
+        console.error(
+          "[Portal Extensão][background] Evento aberto restaurado, mas não foi possível reenfileirá-lo",
+          error
+        );
+      }
+    }
+    return;
+  }
+
+  console.error(
+    "[Portal Extensão][background] Sessão restaurada com metadados de inatividade incompletos; mantendo o usuário ACTIVE sem criar outro evento",
+    {
+      hasStartedAt,
+      hasClientEventId,
+      hasServerEventId
+    }
+  );
+  session.isActive = true;
+  if (hasClientEventId || hasServerEventId) {
+    session.inactivityEndedAt = new Date().toISOString();
+    await finalizarEventoInatividade(
+      new Date(session.inactivityEndedAt).getTime()
+    );
+  } else {
+    // Sem qualquer identificador, manter o marcador em quarentena evita
+    // abrir outro evento para um período cuja referência pode ter sido perdida.
+    session.inactivityEndedAt = new Date().toISOString();
+  }
 }
 
 async function agendarEncerramento() {
@@ -1058,7 +1283,7 @@ async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
     }
   );
 
-  if (duracaoSegundos >= 5) {
+  if (duracaoSegundos >= 5 && sessao.isActive) {
     const info = identificarAplicacao(sessao.url, dados.hostname);
     const registro = {
       url: dados.url,
@@ -1211,9 +1436,16 @@ async function registrarInteracao(
   }
 
   if (currentSession.inactivityEndedAt) {
-    await finalizarEventoInatividade(
-      new Date(currentSession.inactivityEndedAt).getTime()
-    );
+    try {
+      await finalizarEventoInatividade(
+        new Date(currentSession.inactivityEndedAt).getTime()
+      );
+    } catch (error) {
+      console.error(
+        "[Portal Extensão][background] Falha ao retomar encerramento pendente; a sessão continuará ativa",
+        error
+      );
+    }
   }
 
   const safeTitle = obterTituloSeguro(tab.url, tab.title);
@@ -1248,15 +1480,7 @@ async function registrarInteracao(
   }
 
   if (!currentSession.isActive) {
-    await salvarIntervalo(
-      currentSession,
-      currentSession.intervalStart,
-      now,
-      false
-    );
-    await finalizarEventoInatividade(now);
-    currentSession.intervalStart = new Date(now).toISOString();
-    currentSession.isActive = true;
+    await retomarSessaoAposInatividade(now, "user_interaction");
   }
 
   const previousLastActivity = currentSession.lastActivity;
@@ -1316,15 +1540,89 @@ async function registrarInatividade(timestamp = Date.now()) {
   );
 }
 
+async function retomarSessaoAposInatividade(timestamp, reason) {
+  if (!currentSession || currentSession.isActive) {
+    return;
+  }
+
+  const finalized = await finalizarEventoInatividade(timestamp);
+  if (!finalized) {
+    console.warn(
+      "[Portal Extensão][background] Sessão retomada com encerramento de inatividade pendente; será tentado novamente",
+      { tabId: currentSession.tabId, reason }
+    );
+  }
+
+  const resumedAt = new Date(timestamp).toISOString();
+  currentSession.intervalStart = resumedAt;
+  currentSession.lastActivity = resumedAt;
+  currentSession.isActive = true;
+  await persistirSessao();
+  await agendarEncerramento();
+
+  console.info(
+    "[Portal Extensão][background] Sessão retomada após inatividade",
+    { tabId: currentSession.tabId, timestamp: resumedAt, reason }
+  );
+}
+
+async function processarEstadoIdle(state, timestamp = Date.now()) {
+  if (state === "active") {
+    if (
+      currentSession?.isActive &&
+      inactivityThresholdSeconds !== null
+    ) {
+      const deadline =
+        new Date(currentSession.lastActivity).getTime() +
+        inactivityThresholdSeconds * 1000;
+      if (timestamp >= deadline) {
+        await registrarInatividade(deadline);
+      }
+    }
+
+    await retomarSessaoAposInatividade(timestamp, "system_active");
+    return;
+  }
+
+  if (
+    (state === "idle" || state === "locked") &&
+    currentSession?.isActive &&
+    inactivityThresholdSeconds !== null
+  ) {
+    await registrarInatividade(timestamp);
+  }
+}
+
+function consultarEstadoIdle() {
+  const detectionInterval = Math.max(
+    15,
+    inactivityThresholdSeconds || 60
+  );
+
+  return new Promise((resolve, reject) => {
+    chrome.idle.queryState(detectionInterval, (state) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message));
+        return;
+      }
+      resolve(state);
+    });
+  });
+}
+
 async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
   if (!sessao.inactivityClientEventId) {
-    sessao.inactivityClientEventId = criarIdEvento();
+    console.error(
+      "[Portal Extensão][background] Envio de inatividade cancelado: client_event_id ausente"
+    );
+    return false;
   }
-  if (!Object.hasOwn(sessao, "inactivityUserId")) {
+  if (!sessao.inactivityUserId) {
     sessao.inactivityUserId = await obterUserId();
   }
 
-  const startedAtIso = new Date(startedAt).toISOString();
+  const startedAtIso = startedAt ? new Date(startedAt).toISOString() : null;
   const endedAtIso = endedAt ? new Date(endedAt).toISOString() : null;
   await enfileirarRequisicao({
     clientEventId: sessao.inactivityClientEventId,
@@ -1332,14 +1630,14 @@ async function enviarEventoInatividade(sessao, startedAt, endedAt = null) {
     body: {
       client_event_id: sessao.inactivityClientEventId,
       user_id: sessao.inactivityUserId,
-      started_at: startedAtIso,
+      ...(startedAtIso ? { started_at: startedAtIso } : {}),
       ended_at: endedAtIso,
       classification: "inactive",
-      created_at: startedAtIso
+      ...(startedAtIso ? { created_at: startedAtIso } : {})
     }
   });
 
-  return sessao.inactivityClientEventId;
+  return true;
 }
 
 async function criarEventoInatividade(startedAt) {
@@ -1347,52 +1645,179 @@ async function criarEventoInatividade(startedAt) {
     return;
   }
 
+  const hasExistingInactivity =
+    Boolean(currentSession.inactivityStartedAt) ||
+    Boolean(currentSession.inactivityClientEventId) ||
+    Boolean(currentSession.inactivityEventId) ||
+    Boolean(currentSession.inactivityEndedAt);
+
+  if (hasExistingInactivity) {
+    if (
+      !currentSession.inactivityClientEventId &&
+      !currentSession.inactivityEventId &&
+      currentSession.inactivityStartedAt
+    ) {
+      const pendingEvent = await recuperarEventoInatividadeDoOutbox({
+        startedAt: currentSession.inactivityStartedAt,
+        userId: currentSession.inactivityUserId || currentSession.userId || null
+      });
+      if (pendingEvent) {
+        currentSession.inactivityClientEventId =
+          pendingEvent.body?.client_event_id || pendingEvent.clientEventId;
+      }
+    }
+
+    if (
+      currentSession.inactivityStartedAt &&
+      currentSession.inactivityClientEventId
+    ) {
+      try {
+        await enviarEventoInatividade(
+          currentSession,
+          currentSession.inactivityStartedAt,
+          currentSession.inactivityEndedAt
+        );
+        await persistirSessao();
+      } catch (error) {
+        console.error(
+          "[Portal Extensão][background] Abertura já existente não foi substituída; falha ao reenfileirar",
+          error
+        );
+      }
+      return;
+    }
+
+    console.error(
+      "[Portal Extensão][background] Nova abertura de inatividade bloqueada para preservar referência existente",
+      {
+        hasStartedAt: Boolean(currentSession.inactivityStartedAt),
+        hasClientEventId: Boolean(currentSession.inactivityClientEventId),
+        hasServerEventId: Boolean(currentSession.inactivityEventId),
+        hasEndedAt: Boolean(currentSession.inactivityEndedAt)
+      }
+    );
+    await persistirSessao();
+    return;
+  }
+
   currentSession.inactivityStartedAt = new Date(startedAt).toISOString();
   currentSession.inactivityEndedAt = null;
   currentSession.inactivityEventId = null;
   currentSession.inactivityClientEventId = criarIdEvento();
-  currentSession.inactivityUserId = await obterUserId();
+  currentSession.inactivityUserId = currentSession.userId || null;
   await persistirSessao();
 
-  await enviarEventoInatividade(
-    currentSession,
-    currentSession.inactivityStartedAt
-  );
-  await persistirSessao();
+  try {
+    if (!currentSession.inactivityUserId) {
+      currentSession.inactivityUserId = await obterUserId();
+    }
+    await enviarEventoInatividade(
+      currentSession,
+      currentSession.inactivityStartedAt
+    );
+    await persistirSessao();
+  } catch (error) {
+    // O ID e o início já foram persistidos; sessionReady poderá retomar o envio.
+    console.error(
+      "[Portal Extensão][background] Evento de inatividade aberto localmente, mas não foi possível enfileirar a sincronização",
+      {
+        clientEventId: currentSession.inactivityClientEventId,
+        error: error.message || String(error)
+      }
+    );
+  }
 }
 
 async function finalizarEventoInatividade(endedAt) {
-  if (!currentSession?.inactivityStartedAt) {
+  if (!currentSession) {
     return true;
   }
 
-  const startedAt = currentSession.inactivityStartedAt;
-  const endedAtIso = currentSession.inactivityEndedAt ||
-    new Date(endedAt).toISOString();
-  currentSession.inactivityEndedAt = endedAtIso;
-  await persistirSessao();
+  const session = currentSession;
+  const hasStartedAt = Boolean(session.inactivityStartedAt);
+  const hasClientEventId = Boolean(session.inactivityClientEventId);
+  const hasServerEventId = Boolean(session.inactivityEventId);
 
-  if (currentSession.inactivityClientEventId || !currentSession.inactivityEventId) {
-    if (!currentSession.inactivityClientEventId) {
-      currentSession.inactivityClientEventId = criarIdEvento();
+  if (!hasStartedAt && !hasClientEventId && !hasServerEventId) {
+    if (session.inactivityEndedAt) {
+      console.warn(
+        "[Portal Extensão][background] Removendo ended_at sem referência de evento",
+        { tabId: session.tabId }
+      );
+      session.inactivityEndedAt = null;
+      await persistirSessao();
     }
-    await persistirSessao();
-    await enviarEventoInatividade(currentSession, startedAt, endedAtIso);
-  } else {
-    await enfileirarRequisicao({
-      endpoint: `inactivity_events?id=eq.${encodeURIComponent(currentSession.inactivityEventId)}&ended_at=is.null`,
-      method: "PATCH",
-      body: {
-        ended_at: endedAtIso
-      }
-    });
+    return true;
   }
 
-  currentSession.inactivityStartedAt = null;
-  currentSession.inactivityEndedAt = null;
-  currentSession.inactivityEventId = null;
-  currentSession.inactivityClientEventId = null;
-  currentSession.inactivityUserId = null;
+  if (
+    !session.inactivityClientEventId &&
+    !session.inactivityEventId &&
+    session.inactivityStartedAt
+  ) {
+    const pendingEvent = await recuperarEventoInatividadeDoOutbox({
+      startedAt: session.inactivityStartedAt,
+      userId: session.inactivityUserId || session.userId || null
+    });
+    if (pendingEvent) {
+      session.inactivityClientEventId =
+        pendingEvent.body?.client_event_id || pendingEvent.clientEventId;
+      session.inactivityUserId =
+        session.inactivityUserId || pendingEvent.body?.user_id || null;
+    }
+  }
+
+  const startedAt = session.inactivityStartedAt || null;
+  const endedAtIso = session.inactivityEndedAt ||
+    new Date(endedAt).toISOString();
+  session.inactivityEndedAt = endedAtIso;
+  await persistirSessao();
+
+  try {
+    if (session.inactivityClientEventId && startedAt) {
+      await enviarEventoInatividade(session, startedAt, endedAtIso);
+    } else if (session.inactivityClientEventId) {
+      // Reutiliza o ID em um upsert parcial: se a abertura ainda estiver
+      // pendente no outbox, ela será mesclada e não substituída por um PATCH.
+      await enviarEventoInatividade(session, null, endedAtIso);
+    } else if (session.inactivityEventId) {
+      // Chave estável do outbox para o caminho legado; não é UUID do evento.
+      await enfileirarRequisicao({
+        clientEventId: `legacy-inactivity-${session.inactivityEventId}`,
+        endpoint: `inactivity_events?id=eq.${encodeURIComponent(session.inactivityEventId)}&ended_at=is.null`,
+        method: "PATCH",
+        body: {
+          ended_at: endedAtIso
+        }
+      });
+    } else {
+      console.error(
+        "[Portal Extensão][background] Não foi possível identificar o evento para encerramento; referência mantida para recuperação",
+        {
+          startedAt,
+          hasClientEventId: Boolean(session.inactivityClientEventId)
+        }
+      );
+      return false;
+    }
+  } catch (error) {
+    // ended_at fica persistido para retry após atividade ou reinício do worker.
+    console.error(
+      "[Portal Extensão][background] Encerramento não foi persistido no outbox; referência mantida para retry",
+      {
+        clientEventId: session.inactivityClientEventId || null,
+        serverEventId: session.inactivityEventId || null,
+        error: error.message || String(error)
+      }
+    );
+    return false;
+  }
+
+  session.inactivityStartedAt = null;
+  session.inactivityEndedAt = null;
+  session.inactivityEventId = null;
+  session.inactivityClientEventId = null;
+  session.inactivityUserId = null;
   await persistirSessao();
   return true;
 }
@@ -1666,6 +2091,18 @@ function obterDadosUrl(url) {
  * Persiste o evento no outbox antes de iniciar qualquer sincronização.
  */
 async function salvarRegistro(registro) {
+  if (registro.is_active !== true) {
+    console.warn(
+      "[Portal Extensão][background] Registro web_events inativo ignorado; períodos inativos não compõem uso de ferramentas",
+      {
+        domain: obterDadosUrl(registro.url).hostname,
+        inicio: registro.inicio,
+        fim: registro.fim
+      }
+    );
+    return;
+  }
+
   const clientEventId = criarIdEvento();
   const body = {
     client_event_id: clientEventId,
@@ -1801,86 +2238,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   });
 });
 
-const LIMITE_PERIODO_OCIOSO_SEGUNDOS = 14400;
-
-chrome.idle.onStateChanged.addListener(async (state) => {
-  try {
-    const { inicioOciosidade } =
-      await chrome.storage.local.get("inicioOciosidade");
-
-    if (state === "idle" && inicioOciosidade === undefined) {
-      await chrome.storage.local.set({
-        inicioOciosidade:
-          Date.now() - ((inactivityThresholdSeconds ?? 60) * 1000)
-      });
-      return;
-    }
-
-    if (state === "locked" && inicioOciosidade === undefined) {
-      await chrome.storage.local.set({ inicioOciosidade: Date.now() });
-      return;
-    }
-
-    if (state === "active" && inicioOciosidade !== undefined) {
-      await chrome.storage.local.remove("inicioOciosidade");
-      const fim = Date.now();
-      const duracaoSegundos = Math.floor((fim - inicioOciosidade) / 1000);
-
-      if (duracaoSegundos > LIMITE_PERIODO_OCIOSO_SEGUNDOS) {
-        console.warn(
-          "[Portal Extensão][background] Período ocioso descartado (acima do limite)",
-          { inicio: inicioOciosidade, fim, duracaoSegundos }
-        );
-      } else {
-        console.log(
-          "[Portal Extensão][background] Período ocioso detectado",
-          { inicio: inicioOciosidade, fim, duracaoSegundos }
-        );
-      }
-    }
-  } catch (error) {
-    console.error(
-      "[Portal Extensão][background] Falha ao registrar período ocioso",
-      error
-    );
-  }
-});
-
 chrome.idle.onStateChanged.addListener((state) => {
-  if (
-    (state !== "idle" && state !== "locked") ||
-    inactivityThresholdSeconds === null
-  ) {
-    return;
-  }
-
-  void serializarOperacao(async () => {
-    if (!currentSession?.isActive) {
-      return;
-    }
-
-    await registrarInatividade(Date.now());
-  });
+  void serializarOperacao(() => processarEstadoIdle(state));
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void serializarOperacao(async () => {
-    try {
-      await chrome.storage.local.remove("inicioOciosidade");
-    } catch (error) {
-      console.error(
-        "[Portal Extensão][background] Falha ao limpar início da ociosidade na inicialização",
-        error
-      );
-    }
-
     if (!currentSession) {
       return;
     }
 
-    // Do not count time while the browser was closed.
+    // Close active usage at its last interaction; close pending inactivity on startup.
     await encerrarSessao(
-      new Date(currentSession.lastActivity).getTime(),
+      currentSession.isActive
+        ? new Date(currentSession.lastActivity).getTime()
+        : Date.now(),
       "browser_startup"
     );
   });

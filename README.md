@@ -1,13 +1,17 @@
 # portal-produtividade-extension
 Plugin do navegador
 
-Os intervalos de navegação são registrados como ativos enquanto houver
-interação recente do usuário (mouse, teclado, rolagem ou clique). O limite de
-inatividade é lido da tabela `settings`, na chave
-`inactivity_threshold_minutes`, e atualizado periodicamente. Ao atingir o
-limite, a extensão registra o intervalo em `web_events` e abre um evento em
-`inactivity_events`; ao retornar a atividade, finaliza esse evento. O último
-limite válido fica em cache local para uso temporário se o Supabase estiver
+Os intervalos de navegação são registrados em `web_events` como ativos enquanto
+houver interação recente do usuário (mouse, teclado, rolagem ou clique). Ao
+atingir o limite de inatividade, a extensão encerra o intervalo ativo e abre um
+evento separado em `inactivity_events`; períodos inativos não são gravados em
+`web_events`. O evento de inatividade é finalizado ao detectar retorno do
+sistema ou na próxima interação. Na inicialização, a extensão consulta o
+estado atual do sistema para reconciliar eventos pendentes. Também descarta do
+outbox os antigos `web_events` inativos ainda pendentes. O limite de inatividade
+é lido da tabela `settings`, na chave
+`inactivity_threshold_minutes`, e atualizado periodicamente. O último limite
+válido fica em cache local para uso temporário se o Supabase estiver
 indisponível. Uma sessão pendente é recuperada sem contabilizar o período em que
 o navegador esteve fechado.
 
