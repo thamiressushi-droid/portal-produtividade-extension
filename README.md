@@ -31,8 +31,10 @@ Teams, Outlook, Gmail, Slack e Discord), os títulos são substituídos pelo nom
 do aplicativo e o contexto da tela não é coletado.
 
 Todos os `web_events` e `inactivity_events` são gravados primeiro em um outbox
-persistente do IndexedDB da extensão. A sincronização envia um evento por vez,
-na ordem de captura, e só o remove após uma resposta de sucesso. Falhas de rede,
+persistente do IndexedDB da extensão. A sincronização preserva a ordem de
+captura dentro de cada identidade e só remove um evento após uma resposta de
+sucesso. eventos de outra identidade ou sem usuário de origem continuam na fila sem
+bloquear o usuário atual nem serem reatribuídos. Falhas de rede,
 indisponibilidade do Supabase ou ausência de identidade mantêm os eventos na
 fila para novas tentativas. O alarme periódico retoma o envio após reiniciar o
 navegador; IDs idempotentes e a migration

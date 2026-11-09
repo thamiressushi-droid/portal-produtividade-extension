@@ -558,7 +558,7 @@ async function enfileirarRequisicao({
   return clientEventId;
 }
 
-async function obterProximoEventoPendente() {
+async function obterProximoEventoPendente(userId) {
   const database = await abrirOutboxDatabase();
   const transaction = database.transaction(OUTBOX_STORE_NAME, "readonly");
   const completion = aguardarTransacao(transaction);
@@ -567,8 +567,44 @@ async function obterProximoEventoPendente() {
     .index("chronological")
     .openCursor();
   const event = await new Promise((resolve, reject) => {
-    cursorRequest.onsuccess = () =>
-      resolve(cursorRequest.result?.value || null);
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor) {
+        resolve(null);
+        return;
+      }
+
+      const candidate = cursor.value;
+      const eventUserId = candidate.body?.user_id;
+      const isUnattributed = !eventUserId;
+      if (
+        (eventUserId && eventUserId !== userId) ||
+        isUnattributed ||
+        candidate.nextAttemptAt > Date.now()
+      ) {
+        if (
+          (eventUserId && eventUserId !== userId) ||
+          isUnattributed
+        ) {
+          console.info(
+            "[Portal Extensão][sync] Evento mantido no outbox para outra identidade",
+            {
+              eventId: candidate.clientEventId,
+              endpoint: candidate.endpoint.split("?")[0],
+              eventUserId: eventUserId || null,
+              activeUserId: userId,
+              reason: isUnattributed
+                ? "missing_source_user"
+                : "different_user"
+            }
+          );
+        }
+        cursor.continue();
+        return;
+      }
+
+      resolve(candidate);
+    };
     cursorRequest.onerror = () =>
       reject(cursorRequest.error || new Error("Falha ao ler o outbox."));
   });
@@ -646,15 +682,19 @@ function decodificarClaimsJwt(accessToken) {
   }
 }
 
-function registrarRoleWebEvent(role) {
-  console.info("[Portal Extensão][sync] Role da requisição web_events", {
-    endpoint: "web_events",
+function registrarRoleRequisicao(tabelaDestino, role) {
+  const statusKey =
+    tabelaDestino === "inactivity_events"
+      ? "lastInactivityEventRole"
+      : "lastWebEventRole";
+  console.info("[Portal Extensão][sync] Role da requisição", {
+    endpoint: tabelaDestino,
     role
   });
-  void atualizarStatusSincronizacao({ lastWebEventRole: role }).catch(
+  void atualizarStatusSincronizacao({ [statusKey]: role }).catch(
     (error) => {
       console.error(
-        "[Portal Extensão][sync] Falha ao persistir diagnóstico da role web_events",
+        "[Portal Extensão][sync] Falha ao persistir diagnóstico da role",
         error
       );
     }
@@ -674,16 +714,16 @@ async function enviarEventoPendente(event) {
     portalIdentity = await obterIdentidadePortalAtual();
   }
 
-  if (event.method === "POST" && !body.user_id) {
-    body.user_id = portalIdentity?.userId ?? null;
-    if (!body.user_id) {
-      throw new Error("Identidade indisponível; evento mantido na fila.");
-    }
+  if (exigeJwt && event.method === "POST" && !body.user_id) {
+    registrarRoleRequisicao(tabelaDestino, "não enviada (user_id ausente)");
+    throw new Error(
+      `Evento de ${tabelaDestino} sem identidade de origem; não será atribuído à sessão atual.`
+    );
   }
 
   if (exigeJwt) {
     if (!portalIdentity?.userId || !portalIdentity.accessToken) {
-      registrarRoleWebEvent("não enviada (JWT ausente)");
+      registrarRoleRequisicao(tabelaDestino, "não enviada (JWT ausente)");
       throw new Error(
         `Sessão autenticada atual do portal indisponível; ${tabelaDestino} não será enviada como anon.`
       );
@@ -694,7 +734,10 @@ async function enviarEventoPendente(event) {
       tabelaDestino === "inactivity_events" &&
       !body.user_id
     ) {
-      registrarRoleWebEvent("não enviada (user_id ausente no PATCH)");
+      registrarRoleRequisicao(
+        tabelaDestino,
+        "não enviada (user_id ausente no PATCH)"
+      );
       throw new Error(
         "PATCH de inactivity_events sem user_id de origem; evento mantido na fila."
       );
@@ -704,7 +747,10 @@ async function enviarEventoPendente(event) {
     const role =
       typeof claims.role === "string" ? claims.role : "desconhecida";
     if (role !== "authenticated") {
-      registrarRoleWebEvent(`não enviada (JWT role=${role})`);
+      registrarRoleRequisicao(
+        tabelaDestino,
+        `não enviada (JWT role=${role})`
+      );
       throw new Error(
         `JWT do portal usa role=${role}; ${tabelaDestino} exige role authenticated.`
       );
@@ -717,7 +763,10 @@ async function enviarEventoPendente(event) {
       claims.sub !== userIdEsperado ||
       portalIdentity.userId !== userIdEsperado
     ) {
-      registrarRoleWebEvent("não enviada (JWT/user_id incompatíveis)");
+      registrarRoleRequisicao(
+        tabelaDestino,
+        "não enviada (JWT/user_id incompatíveis)"
+      );
       console.error(
         "[Portal Extensão][sync] Identidade do evento diverge da sessão autenticada atual",
         {
@@ -746,9 +795,15 @@ async function enviarEventoPendente(event) {
       }
     );
     authorization = `Bearer ${portalIdentity.accessToken}`;
-    registrarRoleWebEvent("authenticated");
+    registrarRoleRequisicao(tabelaDestino, "authenticated");
   }
 
+  console.info("[Portal Extensão][sync] Enviando evento ao Supabase", {
+    endpoint: tabelaDestino,
+    method: event.method,
+    eventId: event.clientEventId,
+    userId: body.user_id ?? portalIdentity?.userId ?? null
+  });
   const response = await fetch(
     `${SUPABASE_URL}/rest/v1/${event.endpoint}`,
     {
@@ -765,21 +820,36 @@ async function enviarEventoPendente(event) {
   );
 
   if (!response.ok) {
+    const responseBody = await response.text();
+    console.error("[Portal Extensão][sync] Supabase rejeitou evento", {
+      endpoint: tabelaDestino,
+      method: event.method,
+      eventId: event.clientEventId,
+      status: response.status,
+      responseBody
+    });
     throw new Error(
-      `Sincronização de ${event.endpoint} falhou: ${response.status} ${await response.text()}`
+      `Sincronização de ${event.endpoint} falhou: ${response.status} ${responseBody}`
     );
   }
+
+  console.info("[Portal Extensão][sync] Supabase aceitou evento", {
+    endpoint: tabelaDestino,
+    method: event.method,
+    eventId: event.clientEventId,
+    status: response.status,
+    userId: body.user_id ?? portalIdentity?.userId ?? null
+  });
 }
 
 async function processarOutbox() {
   while (true) {
-    const event = await obterProximoEventoPendente();
+    const portalIdentity = await obterIdentidadePortalAtual();
+    const event = await obterProximoEventoPendente(
+      portalIdentity?.userId ?? null
+    );
     if (!event) {
       await atualizarStatusSincronizacao();
-      return;
-    }
-
-    if (event.nextAttemptAt > Date.now()) {
       return;
     }
 
