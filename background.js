@@ -84,6 +84,21 @@ async function persistirIdentidade(userId, { name, accessToken = null }) {
       ? accessToken.trim()
       : null;
 
+  if (userId !== null) {
+    if (!normalizedAccessToken) {
+      throw new Error("A identidade do portal não veio acompanhada do JWT.");
+    }
+
+    const claims = decodificarClaimsJwt(normalizedAccessToken);
+    if (claims.sub !== userId || claims.role !== "authenticated") {
+      throw new Error(
+        "A identidade recebida não corresponde ao usuário autenticado do JWT."
+      );
+    }
+  } else if (normalizedAccessToken) {
+    throw new Error("Logout do portal não pode incluir um JWT.");
+  }
+
   console.info("[Portal Extensão][background] Leitura para persistência", {
     source: name,
     portalUserId: currentUserId || null,
@@ -127,10 +142,6 @@ async function persistirIdentidade(userId, { name, accessToken = null }) {
       return false;
     }
 
-    if (identityChanged && !normalizedAccessToken) {
-      await chrome.storage.local.remove(PORTAL_ACCESS_TOKEN_STORAGE_KEY);
-    }
-
     await chrome.storage.local.set({
       [PORTAL_USER_ID_STORAGE_KEY]: userId,
       ...(normalizedAccessToken
@@ -157,7 +168,7 @@ async function persistirIdentidade(userId, { name, accessToken = null }) {
     });
   }
 
-  if (currentUserId !== userId) {
+  if ((currentUserId || null) !== userId) {
     void serializarOperacao(() => registrarTrocaDeIdentidade(userId));
   }
   if (userId !== null && normalizedAccessToken) {
@@ -168,6 +179,7 @@ async function persistirIdentidade(userId, { name, accessToken = null }) {
 
 async function consultarIdentidadePortal() {
   let portalTabs;
+  let receivedIdentityResponse = false;
   try {
     portalTabs = await chrome.tabs.query({ url: PORTAL_URL_PATTERNS });
   } catch (error) {
@@ -237,6 +249,7 @@ async function consultarIdentidadePortal() {
       }
     }
 
+    receivedIdentityResponse ||= response !== undefined;
     const userId =
       typeof response?.userId === "string" ? response.userId.trim() : "";
     const accessToken =
@@ -259,41 +272,76 @@ async function consultarIdentidadePortal() {
 
   console.info(
     "[Portal Extensão][background] Consulta ao portal sem sessão",
-    { userId: null }
+    {
+      userId: null,
+      receivedIdentityResponse
+    }
   );
-  return null;
+  return receivedIdentityResponse
+    ? { userId: null, accessToken: null }
+    : null;
+}
+
+async function obterIdentidadePortalAtual() {
+  const portalSession = await consultarIdentidadePortal();
+  if (portalSession === null) {
+    const persistedUserId = await lerUserIdPersistido();
+    console.warn(
+      "[Portal Extensão][background] Sessão do portal indisponível; identidade local não será usada como fonte de autenticação",
+      { storedUserId: persistedUserId }
+    );
+    return null;
+  }
+
+  if (!portalSession.userId) {
+    console.info(
+      "[Portal Extensão][background] Portal respondeu sem sessão autenticada",
+      { storedUserId: await lerUserIdPersistido() }
+    );
+    return null;
+  }
+
+  if (!portalSession.accessToken) {
+    throw new Error(
+      "A sessão atual do portal não forneceu um JWT; a identidade não será usada."
+    );
+  }
+
+  const claims = decodificarClaimsJwt(portalSession.accessToken);
+  if (
+    claims.sub !== portalSession.userId ||
+    claims.role !== "authenticated"
+  ) {
+    throw new Error(
+      "A sessão atual do portal e o usuário autenticado do JWT não correspondem."
+    );
+  }
+
+  await persistirIdentidade(portalSession.userId, {
+    name: "portal_active_session",
+    accessToken: portalSession.accessToken
+  });
+  const storedUserId = await lerUserIdPersistido();
+  console.info(
+    "[Portal Extensão][background] Identidade ativa validada",
+    {
+      portalUserId: portalSession.userId,
+      jwtSub: claims.sub,
+      storedUserId,
+      storedMatchesPortal: storedUserId === portalSession.userId
+    }
+  );
+  return { ...portalSession, claims };
 }
 
 async function obterUserId() {
   try {
-    const persistedUserId = await lerUserIdPersistido();
-    if (persistedUserId) {
-      console.info("[Portal Extensão][background] Resultado de obterUserId()", {
-        userId: persistedUserId,
-        source: "chrome.storage.local"
-      });
-      return persistedUserId;
-    }
-
-    const portalSession = await consultarIdentidadePortal();
-    if (portalSession?.userId) {
-      await persistirIdentidade(portalSession.userId, {
-        name: "portal_tab_recovery",
-        accessToken: portalSession.accessToken
-      });
-      const recoveredUserId = await lerUserIdPersistido();
-      console.info("[Portal Extensão][background] Resultado de obterUserId()", {
-        userId: recoveredUserId,
-        source: "portal_tab_recovery"
-      });
-      return recoveredUserId;
-    }
-
-    console.warn("[Portal Extensão][background] Resultado de obterUserId()", {
-      userId: null,
-      source: "no_persisted_identity_or_portal_response"
+    const identity = await obterIdentidadePortalAtual();
+    console.info("[Portal Extensão][background] Resultado de obterUserId()", {
+      userId: identity?.userId ?? null,
+      source: identity ? "portal_active_session" : "no_active_portal_session"
     });
-    return null;
+    return identity?.userId ?? null;
   } catch (error) {
     console.error("[Portal Extensão][background] obterUserId() falhou", error);
     throw error;
@@ -303,6 +351,10 @@ async function obterUserId() {
 const INACTIVITY_SETTINGS_KEY = "inactivity_threshold_minutes";
 const INACTIVITY_SETTINGS_REFRESH_ALARM = "portal-inactivity-settings-refresh";
 const INACTIVITY_ALARM = "portal-session-inactivity";
+const EXTENSION_HEARTBEAT_ALARM = "portal-extension-heartbeat";
+const EXTENSION_HEARTBEAT_STORAGE_KEY = "extensionHeartbeatAt";
+const EXTENSION_HEARTBEAT_INTERVAL_MINUTES = 1;
+const EXTENSION_HEARTBEAT_TIMEOUT_MS = 3 * 60 * 1000;
 const PRIVATE_APPLICATIONS = [
   {
     name: "Copilot",
@@ -611,42 +663,44 @@ function registrarRoleWebEvent(role) {
 
 async function enviarEventoPendente(event) {
   const body = prepararBodyRequisicao(event.endpoint, event.body);
-  if (event.method === "POST" && !body.user_id) {
-    body.user_id = await obterUserId();
-    if (!body.user_id) {
-      throw new Error("Identidade indisponível; evento mantido na fila.");
-    }
-  }
-
   const tabelaDestino = event.endpoint.split("?")[0];
   // web_events e inactivity_events só aceitam escrita da role authenticated
   // (migrations 0028/0029 revogaram INSERT/UPDATE de anon).
   const exigeJwt =
     tabelaDestino === "web_events" || tabelaDestino === "inactivity_events";
   let authorization;
-  if (exigeJwt) {
-    const {
-      [PORTAL_USER_ID_STORAGE_KEY]: portalUserId,
-      [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: accessToken
-    } = await chrome.storage.local.get([
-      PORTAL_USER_ID_STORAGE_KEY,
-      PORTAL_ACCESS_TOKEN_STORAGE_KEY
-    ]);
+  let portalIdentity = null;
+  if (exigeJwt || (event.method === "POST" && !body.user_id)) {
+    portalIdentity = await obterIdentidadePortalAtual();
+  }
 
-    if (typeof accessToken !== "string" || !accessToken.trim()) {
+  if (event.method === "POST" && !body.user_id) {
+    body.user_id = portalIdentity?.userId ?? null;
+    if (!body.user_id) {
+      throw new Error("Identidade indisponível; evento mantido na fila.");
+    }
+  }
+
+  if (exigeJwt) {
+    if (!portalIdentity?.userId || !portalIdentity.accessToken) {
       registrarRoleWebEvent("não enviada (JWT ausente)");
       throw new Error(
-        `JWT da sessão do portal indisponível; ${tabelaDestino} não será enviada como anon.`
+        `Sessão autenticada atual do portal indisponível; ${tabelaDestino} não será enviada como anon.`
       );
     }
 
-    let claims;
-    try {
-      claims = decodificarClaimsJwt(accessToken);
-    } catch (error) {
-      registrarRoleWebEvent("não enviada (JWT inválido)");
-      throw error;
+    if (
+      event.method === "PATCH" &&
+      tabelaDestino === "inactivity_events" &&
+      !body.user_id
+    ) {
+      registrarRoleWebEvent("não enviada (user_id ausente no PATCH)");
+      throw new Error(
+        "PATCH de inactivity_events sem user_id de origem; evento mantido na fila."
+      );
     }
+
+    const claims = portalIdentity.claims;
     const role =
       typeof claims.role === "string" ? claims.role : "desconhecida";
     if (role !== "authenticated") {
@@ -656,21 +710,42 @@ async function enviarEventoPendente(event) {
       );
     }
 
-    // PATCH (ex.: fechar inactivity_events) não leva user_id no body:
-    // nesse caso valida contra a identidade persistida do portal.
-    const userIdEsperado = body.user_id ?? portalUserId;
+    // PATCH (ex.: fechar inactivity_events) não leva user_id no body.
+    const userIdEsperado = body.user_id ?? portalIdentity.userId;
     if (
       typeof claims.sub !== "string" ||
       claims.sub !== userIdEsperado ||
-      portalUserId !== userIdEsperado
+      portalIdentity.userId !== userIdEsperado
     ) {
       registrarRoleWebEvent("não enviada (JWT/user_id incompatíveis)");
+      console.error(
+        "[Portal Extensão][sync] Identidade do evento diverge da sessão autenticada atual",
+        {
+          endpoint: tabelaDestino,
+          method: event.method,
+          eventUserId: body.user_id ?? null,
+          portalUserId: portalIdentity.userId,
+          authUid: claims.sub ?? null,
+          matches: false
+        }
+      );
       throw new Error(
         `JWT do portal não corresponde ao user_id do evento; ${tabelaDestino} não será enviada.`
       );
     }
 
-    authorization = `Bearer ${accessToken}`;
+    console.info(
+      "[Portal Extensão][sync] Identidade validada para evento",
+      {
+        endpoint: tabelaDestino,
+        method: event.method,
+        eventUserId: body.user_id ?? null,
+        portalUserId: portalIdentity.userId,
+        authUid: claims.sub,
+        matches: true
+      }
+    );
+    authorization = `Bearer ${portalIdentity.accessToken}`;
     registrarRoleWebEvent("authenticated");
   }
 
@@ -972,18 +1047,26 @@ const sessionReady = chrome.storage.local
     await chrome.alarms.create(OUTBOX_SYNC_ALARM, {
       periodInMinutes: 1
     });
+    await chrome.alarms.create(EXTENSION_HEARTBEAT_ALARM, {
+      periodInMinutes: EXTENSION_HEARTBEAT_INTERVAL_MINUTES
+    });
     if (currentSession) {
       await restaurarEventoInatividadeSessao();
-      if (!currentSession.isActive) {
-        try {
-          await processarEstadoIdle(await consultarEstadoIdle());
-        } catch (error) {
-          console.error(
-            "[Portal Extensão][background] Não foi possível reconciliar a sessão com o estado atual do sistema",
-            error
-          );
-        }
+    }
+
+    const absenceDetected = await atualizarHeartbeat();
+    if (currentSession && !absenceDetected && !currentSession.isActive) {
+      try {
+        await processarEstadoIdle(await consultarEstadoIdle());
+      } catch (error) {
+        console.error(
+          "[Portal Extensão][background] Não foi possível reconciliar a sessão com o estado atual do sistema",
+          error
+        );
       }
+    }
+
+    if (currentSession) {
       await persistirSessao();
     }
     void sincronizarOutbox();
@@ -1005,15 +1088,73 @@ const sessionReady = chrome.storage.local
     console.error("Erro ao recuperar sessão ativa:", error);
   });
 
-function serializarOperacao(callback) {
+function serializarOperacao(callback = () => {}) {
   sessionOperation = sessionOperation
     .then(() => sessionReady)
-    .then(callback)
+    .then(async () => {
+      await atualizarHeartbeat();
+      return callback();
+    })
     .catch((error) => {
       console.error("Erro ao atualizar sessão:", error);
     });
 
   return sessionOperation;
+}
+
+async function atualizarHeartbeat(timestamp = Date.now()) {
+  const { [EXTENSION_HEARTBEAT_STORAGE_KEY]: storedHeartbeat } =
+    await chrome.storage.local.get(EXTENSION_HEARTBEAT_STORAGE_KEY);
+  const parsedHeartbeat =
+    typeof storedHeartbeat === "string" ? Date.parse(storedHeartbeat) : NaN;
+  const hasPreviousHeartbeat = Number.isFinite(parsedHeartbeat);
+  const heartbeatGap = hasPreviousHeartbeat &&
+    timestamp - parsedHeartbeat > EXTENSION_HEARTBEAT_TIMEOUT_MS;
+  const missingPreviousHeartbeat =
+    !hasPreviousHeartbeat && Boolean(currentSession);
+  const absenceDetected = heartbeatGap || missingPreviousHeartbeat;
+
+  if (storedHeartbeat && !hasPreviousHeartbeat) {
+    console.warn(
+      "[Portal Extensão][background] Heartbeat persistido inválido; a sessão será encerrada no último instante conhecido",
+      { storedHeartbeat }
+    );
+  }
+
+  if (absenceDetected && currentSession) {
+    const knownTimes = [
+      parsedHeartbeat,
+      Date.parse(currentSession.lastActivity),
+      Date.parse(currentSession.intervalStart || currentSession.inicio),
+      Date.parse(currentSession.inicio)
+    ].filter(Number.isFinite);
+    const lastKnownPresence = Math.min(
+      timestamp,
+      knownTimes.length ? Math.max(...knownTimes) : timestamp
+    );
+
+    console.warn(
+      "[Portal Extensão][background] Ausência detectada por lacuna no heartbeat; encerrando o período no último instante conhecido",
+      {
+        lastHeartbeatAt: hasPreviousHeartbeat
+          ? new Date(parsedHeartbeat).toISOString()
+          : null,
+        absenceDurationMs: hasPreviousHeartbeat
+          ? timestamp - parsedHeartbeat
+          : null,
+        endedAt: new Date(lastKnownPresence).toISOString()
+      }
+    );
+    await encerrarSessao(
+      lastKnownPresence,
+      hasPreviousHeartbeat ? "heartbeat_timeout" : "heartbeat_unavailable"
+    );
+  }
+
+  await chrome.storage.local.set({
+    [EXTENSION_HEARTBEAT_STORAGE_KEY]: new Date(timestamp).toISOString()
+  });
+  return absenceDetected;
 }
 
 async function persistirSessao() {
@@ -1783,6 +1924,7 @@ async function finalizarEventoInatividade(endedAt) {
         endpoint: `inactivity_events?id=eq.${encodeURIComponent(session.inactivityEventId)}&ended_at=is.null`,
         method: "PATCH",
         body: {
+          user_id: session.inactivityUserId || session.userId || null,
           ended_at: endedAtIso
         }
       });
@@ -2190,6 +2332,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === EXTENSION_HEARTBEAT_ALARM) {
+    void serializarOperacao();
+    return;
+  }
+
   if (alarm.name === OUTBOX_SYNC_ALARM) {
     void sincronizarOutbox();
     return;
@@ -2335,11 +2482,22 @@ chrome.runtime.onMessage.addListener(
       name: "portal_identity_message",
       accessToken
     })
-      .then((changed) => {
+      .then(async (changed) => {
+        await sessionOperation;
+        const storedUserId = await lerUserIdPersistido();
+        console.info(
+          "[Portal Extensão][background] PORTAL_IDENTITY_CHANGED aplicado",
+          {
+            receivedUserId: userId,
+            storedUserId,
+            matches: storedUserId === userId,
+            sessionUserId: currentSession?.userId ?? null
+          }
+        );
         sendResponse({
           ok: true,
-          stage: changed ? "storage" : "unchanged",
-          ...(userId === null ? { userId: null } : {})
+          stage: changed ? "applied" : "unchanged",
+          userId
         });
       })
       .catch((error) => {
