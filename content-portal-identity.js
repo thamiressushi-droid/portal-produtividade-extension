@@ -8,11 +8,13 @@
   }
   globalThis[bridgeGlobalKey] = true;
 
-  const pageIdentityMessageType = "identity";
+  const portalAuthMessageSource = "portal-produtividade-auth";
   const backgroundIdentityMessageType = "PORTAL_IDENTITY_CHANGED";
   const backgroundIdentityRequestType = "PORTAL_GET_AUTHENTICATED_USER";
   const supabaseAuthStorageKey = "sb-lqiftfrbdtqcrfxcthao-auth-token";
   let lastReportedIdentity;
+  let portalSessionCleared = false;
+  let authenticationState = "disconnected";
 
   function getAuthSession() {
     try {
@@ -37,17 +39,24 @@
       }
 
       const session = JSON.parse(serializedSession);
+      const sessionUser =
+        session?.user ||
+        session?.session?.user ||
+        session?.currentSession?.user ||
+        session?.data?.user ||
+        session?.data?.session?.user;
       const userId =
-        session?.user?.id ||
-        session?.session?.user?.id ||
-        session?.currentSession?.user?.id ||
-        session?.data?.user?.id ||
-        session?.data?.session?.user?.id;
+        sessionUser?.id;
       const accessToken =
         session?.access_token ||
         session?.session?.access_token ||
         session?.currentSession?.access_token ||
         session?.data?.session?.access_token;
+      const expiresAt =
+        session?.expires_at ||
+        session?.session?.expires_at ||
+        session?.currentSession?.expires_at ||
+        session?.data?.session?.expires_at;
 
       const normalizedUserId =
         typeof userId === "string" && userId.trim()
@@ -62,7 +71,12 @@
         receivedJwt: Boolean(normalizedAccessToken),
         storageKey: supabaseAuthStorageKey
       });
-      return { userId: normalizedUserId, accessToken: normalizedAccessToken };
+      return {
+        userId: normalizedUserId,
+        accessToken: normalizedAccessToken,
+        email: typeof sessionUser?.email === "string" ? sessionUser.email : null,
+        expiresAt: expiresAt ?? null
+      };
     } catch (error) {
       console.warn(
         "[Portal Extensão][content] Não foi possível ler a sessão Supabase",
@@ -77,7 +91,11 @@
     }
   }
 
-  function notifyBackground(userId, accessToken = null) {
+  function notifyBackground(
+    userId,
+    accessToken = null,
+    { email = null, expiresAt = null } = {}
+  ) {
     if (
       userId !== null &&
       (typeof userId !== "string" || !userId.trim())
@@ -89,7 +107,12 @@
       typeof accessToken === "string" && accessToken.trim()
         ? accessToken.trim()
         : null;
-    const identityKey = `${userId || ""}:${normalizedAccessToken || ""}`;
+    const identityKey = JSON.stringify([
+      userId,
+      normalizedAccessToken,
+      email,
+      expiresAt
+    ]);
     if (
       lastReportedIdentity !== undefined &&
       identityKey === lastReportedIdentity
@@ -98,17 +121,22 @@
     }
 
     lastReportedIdentity = identityKey;
+    authenticationState =
+      userId && normalizedAccessToken ? "authenticated" : "disconnected";
     chrome.runtime.sendMessage(
       {
         type: backgroundIdentityMessageType,
         userId,
-        accessToken: normalizedAccessToken
+        accessToken: normalizedAccessToken,
+        email,
+        expiresAt
       },
       (response) => {
         const runtimeError = chrome.runtime.lastError;
 
         if (runtimeError) {
           lastReportedIdentity = undefined;
+          authenticationState = "disconnected";
           console.error(
             "[Portal Extensão][content] Falha ao persistir identidade",
             runtimeError.message
@@ -116,8 +144,14 @@
           return;
         }
 
+        if (response?.authState?.status) {
+          authenticationState = response.authState.status;
+        }
+
         if (!response?.ok) {
-          lastReportedIdentity = undefined;
+          if (!response?.authState) {
+            lastReportedIdentity = undefined;
+          }
           console.error(
             "[Portal Extensão][content] Background não confirmou a identidade",
             response
@@ -129,7 +163,7 @@
 
   console.info("[Portal Extensão][content] Bridge carregado", {
     pageUrl: window.location.href,
-    expectedMessageType: pageIdentityMessageType
+    expectedMessageSource: portalAuthMessageSource
   });
 
   window.addEventListener("message", (event) => {
@@ -152,48 +186,56 @@
       return;
     }
 
-    if (messageType !== pageIdentityMessageType) {
-      console.info(
-        "[Portal Extensão][content] postMessage ignorado: tipo inesperado",
-        {
-          expectedMessageType: pageIdentityMessageType,
-          receivedMessageType: messageType
-        }
-      );
-      return;
-    }
-
-    const userId = Object.hasOwn(data, "userId")
-      ? data.userId
-      : data.user?.id ?? data.session?.user?.id;
-    const authSession = getAuthSession();
-
-    if (userId === undefined) {
-      console.error(
-        "[Portal Extensão][content] Identidade ignorada: userId ausente"
-      );
-      return;
-    }
-
-    if (typeof userId !== "string" || !userId.trim()) {
-      if (userId === null) {
+    if (
+      typeof data === "object" &&
+      data !== null &&
+      data.source === portalAuthMessageSource
+    ) {
+      if (data.type === "SESSION_CLEARED") {
+        portalSessionCleared = true;
+        authenticationState = "disconnected";
+        lastReportedIdentity = undefined;
         notifyBackground(null, null);
         return;
       }
 
-      console.error(
-        "[Portal Extensão][content] Identidade ignorada: userId inválido",
-        { receivedType: typeof userId }
+      if (data.type === "SESSION_SYNC") {
+        if (
+          typeof data.userId !== "string" ||
+          !data.userId.trim() ||
+          typeof data.accessToken !== "string" ||
+          !data.accessToken.trim()
+        ) {
+          console.error(
+            "[Portal Extensão][content] Sessão ignorada: userId ou accessToken inválido"
+          );
+          return;
+        }
+
+        portalSessionCleared = false;
+        lastReportedIdentity = undefined;
+        notifyBackground(data.userId.trim(), data.accessToken.trim(), {
+          email: typeof data.email === "string" ? data.email : null,
+          expiresAt: data.expiresAt ?? null
+        });
+        console.info("[Portal Extensão][content] Sincronização de sessão recebida", {
+          authenticationState,
+          userId: data.userId.trim(),
+          receivedJwt: true
+        });
+        return;
+      }
+
+      console.info(
+        "[Portal Extensão][content] postMessage ignorado: tipo de autenticação inesperado",
+        { messageType }
       );
       return;
     }
 
-    const normalizedUserId = userId.trim();
-    notifyBackground(
-      normalizedUserId,
-      authSession.userId === normalizedUserId
-        ? authSession.accessToken
-        : null
+    console.info(
+      "[Portal Extensão][content] postMessage ignorado: source inesperado",
+      { receivedSource: data?.source ?? null }
     );
   });
 
@@ -214,9 +256,16 @@
   });
 
   function refreshAuthIdentity() {
+    if (portalSessionCleared) {
+      return;
+    }
+
     const authSession = getAuthSession();
     if (authSession.userId) {
-      notifyBackground(authSession.userId, authSession.accessToken);
+      notifyBackground(authSession.userId, authSession.accessToken, {
+        email: authSession.email,
+        expiresAt: authSession.expiresAt
+      });
     }
   }
 
@@ -234,7 +283,10 @@
               "[Portal Extensão][content] Sessão restaurada; identidade preservada",
               { userId: currentSession.userId }
             );
-            notifyBackground(currentSession.userId, currentSession.accessToken);
+            notifyBackground(currentSession.userId, currentSession.accessToken, {
+              email: currentSession.email,
+              expiresAt: currentSession.expiresAt
+            });
             return;
           }
 
@@ -242,9 +294,11 @@
             "[Portal Extensão][content] Logout confirmado pela remoção da sessão",
             { userId: null }
           );
+          portalSessionCleared = true;
           notifyBackground(null, null);
         }, 1_000);
       } else {
+        portalSessionCleared = false;
         refreshAuthIdentity();
       }
     }

@@ -27,6 +27,35 @@
       overflow-wrap: anywhere;
     }
 
+    #auth-warning {
+      margin-bottom: 12px;
+      padding: 10px;
+      border: 1px solid #b54708;
+      border-radius: 4px;
+      background: #fff4e5;
+      color: #7a2e0e;
+    }
+
+    #auth-warning[hidden] {
+      display: none;
+    }
+
+    #connect-portal {
+      margin-top: 8px;
+      padding: 7px 10px;
+      border: 0;
+      border-radius: 4px;
+      background: #8a3412;
+      color: #fff;
+      cursor: pointer;
+    }
+
+    #connect-error {
+      display: block;
+      margin-top: 6px;
+      overflow-wrap: anywhere;
+    }
+
     #capture-diagnostics {
       margin-bottom: 12px;
       padding: 8px;
@@ -58,6 +87,11 @@
 
   <h2>Portal Produtividade</h2>
 
+  <section id="auth-warning" aria-live="assertive" hidden>
+    <strong>⚠️ Sessão desconectada ou expirada</strong><br>
+    <button id="connect-portal" type="button">Conectar ao Portal</button>
+    <span id="connect-error" role="status"></span>
+  </section>
   <section id="sync-status" aria-live="polite"></section>
   <section id="capture-diagnostics" aria-live="polite">
     <strong>Diagnóstico da captura (último clique)</strong>

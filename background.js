@@ -11,6 +11,8 @@ const OUTBOX_DATABASE_VERSION = 1;
 const OUTBOX_STORE_NAME = "outbox";
 const OUTBOX_SYNC_ALARM = "portal-outbox-sync";
 const SYNC_STATUS_STORAGE_KEY = "syncStatus";
+const PORTAL_AUTH_STATE_STORAGE_KEY = "portalAuthState";
+const PORTAL_AUTH_EXPIRY_ALARM = "portal-auth-expiry";
 const PORTAL_USER_ID_STORAGE_KEY = "portalUserId";
 const PORTAL_ACCESS_TOKEN_STORAGE_KEY = "portalAccessToken";
 const INACTIVITY_EVENT_FIELDS = new Set([
@@ -67,103 +69,19 @@ async function lerUserIdPersistido() {
   }
 }
 
-async function persistirIdentidade(userId, { name, accessToken = null }) {
-  const {
-    [PORTAL_USER_ID_STORAGE_KEY]: portalUserId,
-    [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: portalAccessToken
-  } = await chrome.storage.local.get([
-    PORTAL_USER_ID_STORAGE_KEY,
-    PORTAL_ACCESS_TOKEN_STORAGE_KEY
-  ]);
-  const currentUserId =
-    typeof portalUserId === "string" ? portalUserId.trim() : "";
-  const currentAccessToken =
-    typeof portalAccessToken === "string" ? portalAccessToken : "";
-  const normalizedAccessToken =
-    typeof accessToken === "string" && accessToken.trim()
-      ? accessToken.trim()
-      : null;
-
-  console.info("[Portal Extensão][background] Leitura para persistência", {
-    source: name,
-    portalUserId: currentUserId || null,
-    found: Boolean(currentUserId),
-    receivedJwt: Boolean(normalizedAccessToken)
-  });
-
-  if (userId === null) {
-    await chrome.storage.local.remove([
-      PORTAL_USER_ID_STORAGE_KEY,
-      PORTAL_ACCESS_TOKEN_STORAGE_KEY
-    ]);
-    const stored = await chrome.storage.local.get([
-      PORTAL_USER_ID_STORAGE_KEY,
-      PORTAL_ACCESS_TOKEN_STORAGE_KEY
-    ]);
-    if (
-      stored[PORTAL_USER_ID_STORAGE_KEY] !== undefined ||
-      stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY] !== undefined
-    ) {
-      throw new Error("Storage não confirmou a remoção da identidade.");
-    }
-
-    console.info("[Portal Extensão][background] Identidade removida", {
-      source: name,
-      portalUserId: null,
-      hadIdentity: Boolean(currentUserId)
-    });
-  } else {
-    const identityChanged = currentUserId !== userId;
-    const tokenChanged =
-      normalizedAccessToken !== null &&
-      normalizedAccessToken !== currentAccessToken;
-    if (!identityChanged && !tokenChanged) {
-      console.info("[Portal Extensão][background] Identidade já persistida", {
-        source: name,
-        portalUserId: currentUserId,
-        hasIdentity: true,
-        hasJwt: Boolean(currentAccessToken)
-      });
-      return false;
-    }
-
-    if (identityChanged && !normalizedAccessToken) {
-      await chrome.storage.local.remove(PORTAL_ACCESS_TOKEN_STORAGE_KEY);
-    }
-
-    await chrome.storage.local.set({
-      [PORTAL_USER_ID_STORAGE_KEY]: userId,
-      ...(normalizedAccessToken
-        ? { [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: normalizedAccessToken }
-        : {})
-    });
-    const stored = await chrome.storage.local.get([
-      PORTAL_USER_ID_STORAGE_KEY,
-      PORTAL_ACCESS_TOKEN_STORAGE_KEY
-    ]);
-    if (
-      stored[PORTAL_USER_ID_STORAGE_KEY] !== userId ||
-      (normalizedAccessToken &&
-        stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY] !== normalizedAccessToken)
-    ) {
-      throw new Error("Storage não confirmou a identidade esperada.");
-    }
-
-    console.info("[Portal Extensão][background] Identidade gravada", {
-      source: name,
-      portalUserId: userId,
-      hasIdentity: true,
-      hasJwt: Boolean(stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY])
-    });
-  }
-
-  if (currentUserId !== userId) {
-    void serializarOperacao(() => registrarTrocaDeIdentidade(userId));
-  }
-  if (userId !== null && normalizedAccessToken) {
-    void sincronizarOutbox();
-  }
-  return true;
+async function persistirIdentidade(
+  userId,
+  { name, accessToken = null, email = null, expiresAt = null } = {}
+) {
+  return serializarAtualizacaoAutenticacao(() =>
+    atualizarSessaoAutenticacao({
+      userId,
+      accessToken,
+      email,
+      expiresAt,
+      source: name
+    })
+  );
 }
 
 async function consultarIdentidadePortal() {
@@ -346,6 +264,8 @@ let inactivityThresholdSeconds = null;
 let sessionOperation = Promise.resolve();
 let outboxDatabasePromise;
 let synchronizationOperation = Promise.resolve();
+let authenticationOperation = Promise.resolve();
+let identityTransitionOperation = Promise.resolve();
 
 function abrirOutboxDatabase() {
   if (!outboxDatabasePromise) {
@@ -581,6 +501,281 @@ function decodificarClaimsJwt(accessToken) {
   }
 }
 
+function converterExpiracaoToken(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1_000_000_000_000 ? value : value * 1000;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const numericValue = Number(value);
+    if (Number.isFinite(numericValue)) {
+      return numericValue > 1_000_000_000_000
+        ? numericValue
+        : numericValue * 1000;
+    }
+
+    const parsedDate = Date.parse(value);
+    if (!Number.isNaN(parsedDate)) {
+      return parsedDate;
+    }
+  }
+
+  return null;
+}
+
+function validarSessaoPortal(userId, accessToken, expiresAt) {
+  if (
+    typeof userId !== "string" ||
+    !userId.trim() ||
+    typeof accessToken !== "string" ||
+    !accessToken.trim()
+  ) {
+    return { status: "disconnected", expiresAt: null };
+  }
+
+  let claims;
+  try {
+    claims = decodificarClaimsJwt(accessToken);
+  } catch {
+    return { status: "disconnected", expiresAt: null };
+  }
+
+  const tokenExpiration = Number(claims.exp) * 1000;
+  if (
+    claims.role !== "authenticated" ||
+    claims.sub !== userId ||
+    !Number.isFinite(tokenExpiration)
+  ) {
+    return { status: "disconnected", expiresAt: null };
+  }
+
+  const suppliedExpiration = converterExpiracaoToken(expiresAt);
+  const effectiveExpiration = suppliedExpiration
+    ? Math.min(tokenExpiration, suppliedExpiration)
+    : tokenExpiration;
+
+  if (effectiveExpiration <= Date.now()) {
+    return { status: "expired", expiresAt: effectiveExpiration };
+  }
+
+  return {
+    status: "authenticated",
+    expiresAt: effectiveExpiration
+  };
+}
+
+function serializarAtualizacaoAutenticacao(callback) {
+  const operation = authenticationOperation.then(callback);
+  authenticationOperation = operation.catch((error) => {
+    console.error(
+      "[Portal Extensão][auth] Falha ao atualizar estado de autenticação",
+      error
+    );
+  });
+  return operation;
+}
+
+function agendarTransicaoDeIdentidade(userId) {
+  identityTransitionOperation = identityTransitionOperation.then(() =>
+    serializarOperacao(() => registrarTrocaDeIdentidade(userId))
+  );
+  return identityTransitionOperation;
+}
+
+async function gravarEstadoAutenticacao(
+  status,
+  userId = null,
+  email = null,
+  expiresAt = null
+) {
+  const authState = {
+    status,
+    userId,
+    email,
+    expiresAt,
+    updatedAt: new Date().toISOString()
+  };
+  await chrome.storage.local.set({
+    [PORTAL_AUTH_STATE_STORAGE_KEY]: authState
+  });
+  return authState;
+}
+
+async function removerCredenciaisPortal(
+  status,
+  email = null,
+  expiresAt = null
+) {
+  await gravarEstadoAutenticacao(status, null, email, expiresAt);
+  await chrome.storage.local.remove([
+    PORTAL_USER_ID_STORAGE_KEY,
+    PORTAL_ACCESS_TOKEN_STORAGE_KEY
+  ]);
+  await chrome.alarms.clear(PORTAL_AUTH_EXPIRY_ALARM);
+}
+
+async function atualizarSessaoAutenticacao({
+  userId,
+  accessToken,
+  email,
+  expiresAt,
+  source
+}) {
+  const stored = await chrome.storage.local.get([
+    PORTAL_USER_ID_STORAGE_KEY,
+    PORTAL_ACCESS_TOKEN_STORAGE_KEY,
+    PORTAL_AUTH_STATE_STORAGE_KEY
+  ]);
+  const currentUserId =
+    typeof stored[PORTAL_USER_ID_STORAGE_KEY] === "string"
+      ? stored[PORTAL_USER_ID_STORAGE_KEY].trim()
+      : null;
+  const previousState = stored[PORTAL_AUTH_STATE_STORAGE_KEY];
+
+  if (userId === null) {
+    await removerCredenciaisPortal("disconnected");
+    if (currentUserId || currentSession?.userId) {
+      void agendarTransicaoDeIdentidade(null);
+    }
+    console.info("[Portal Extensão][auth] Sessão do portal removida", {
+      source,
+      hadIdentity: Boolean(currentUserId)
+    });
+    return Boolean(currentUserId || previousState?.status !== "disconnected");
+  }
+
+  const validation = validarSessaoPortal(userId, accessToken, expiresAt);
+  if (validation.status !== "authenticated") {
+    await removerCredenciaisPortal(
+      validation.status,
+      typeof email === "string" ? email : null,
+      validation.expiresAt
+    );
+    if (currentUserId || currentSession?.userId) {
+      void agendarTransicaoDeIdentidade(null);
+    }
+    console.warn("[Portal Extensão][auth] Sessão inválida ou expirada", {
+      source,
+      status: validation.status
+    });
+    return false;
+  }
+
+  const normalizedUserId = userId.trim();
+  const normalizedEmail =
+    typeof email === "string" && email.trim() ? email.trim() : null;
+  const normalizedToken = accessToken.trim();
+  const authState = {
+    status: "authenticated",
+    userId: normalizedUserId,
+    email: normalizedEmail,
+    expiresAt: validation.expiresAt,
+    updatedAt: new Date().toISOString()
+  };
+  const changed =
+    currentUserId !== normalizedUserId ||
+    stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY] !== normalizedToken ||
+    previousState?.status !== "authenticated" ||
+    previousState?.expiresAt !== validation.expiresAt;
+
+  await chrome.storage.local.set({
+    [PORTAL_USER_ID_STORAGE_KEY]: normalizedUserId,
+    [PORTAL_ACCESS_TOKEN_STORAGE_KEY]: normalizedToken,
+    [PORTAL_AUTH_STATE_STORAGE_KEY]: authState
+  });
+  await chrome.alarms.create(PORTAL_AUTH_EXPIRY_ALARM, {
+    when: validation.expiresAt
+  });
+
+  if (
+    currentUserId !== normalizedUserId ||
+    currentSession?.userId !== normalizedUserId
+  ) {
+    const transition = agendarTransicaoDeIdentidade(normalizedUserId);
+    void transition.then(() => sincronizarOutbox());
+  } else {
+    void sincronizarOutbox();
+  }
+
+  console.info("[Portal Extensão][auth] Sessão do portal atualizada", {
+    source,
+    userId: normalizedUserId,
+    hasJwt: true,
+    expiresAt: new Date(validation.expiresAt).toISOString()
+  });
+  return changed;
+}
+
+async function validarSessaoPersistida() {
+  return serializarAtualizacaoAutenticacao(async () => {
+    const stored = await chrome.storage.local.get([
+      PORTAL_USER_ID_STORAGE_KEY,
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY,
+      PORTAL_AUTH_STATE_STORAGE_KEY
+    ]);
+    const userId =
+      typeof stored[PORTAL_USER_ID_STORAGE_KEY] === "string"
+        ? stored[PORTAL_USER_ID_STORAGE_KEY].trim()
+        : null;
+    const accessToken = stored[PORTAL_ACCESS_TOKEN_STORAGE_KEY];
+    const previousState = stored[PORTAL_AUTH_STATE_STORAGE_KEY];
+    const validation = validarSessaoPortal(
+      userId,
+      accessToken,
+      previousState?.expiresAt
+    );
+
+    if (validation.status !== "authenticated") {
+      const hadCredentials = Boolean(userId || accessToken);
+      const status =
+        !hadCredentials && previousState?.status === "expired"
+          ? "expired"
+          : validation.status;
+      const stateChanged = previousState?.status !== status;
+      if (stateChanged || hadCredentials) {
+        await removerCredenciaisPortal(
+          status,
+          previousState?.email ?? null,
+          validation.expiresAt
+        );
+      }
+      if (userId || currentSession?.userId) {
+        void agendarTransicaoDeIdentidade(null);
+      }
+      return {
+        status,
+        userId: null,
+        email: previousState?.email ?? null,
+        expiresAt: validation.expiresAt
+      };
+    }
+
+    const authState = {
+      status: "authenticated",
+      userId,
+      email: previousState?.email ?? null,
+      expiresAt: validation.expiresAt,
+      updatedAt: previousState?.updatedAt || new Date().toISOString()
+    };
+    if (
+      previousState?.status !== "authenticated" ||
+      previousState?.userId !== userId ||
+      previousState?.expiresAt !== validation.expiresAt
+    ) {
+      await chrome.storage.local.set({
+        [PORTAL_AUTH_STATE_STORAGE_KEY]: authState
+      });
+    }
+    await chrome.alarms.create(PORTAL_AUTH_EXPIRY_ALARM, {
+      when: validation.expiresAt
+    });
+    if (currentSession?.userId !== userId) {
+      void agendarTransicaoDeIdentidade(userId);
+    }
+    return authState;
+  });
+}
+
 function registrarRoleWebEvent(role) {
   console.info("[Portal Extensão][sync] Role da requisição web_events", {
     endpoint: "web_events",
@@ -596,12 +791,26 @@ function registrarRoleWebEvent(role) {
   );
 }
 
+class SessaoPortalIndisponivelError extends Error {
+  constructor() {
+    super("A sessão autenticada do portal não está disponível.");
+    this.name = "SessaoPortalIndisponivelError";
+  }
+}
+
+class EventoIncompativelComSessaoError extends Error {
+  constructor() {
+    super("JWT do portal não corresponde ao user_id do evento.");
+    this.name = "EventoIncompativelComSessaoError";
+  }
+}
+
 async function enviarEventoPendente(event) {
   const body = prepararBodyRequisicao(event.endpoint, event.body);
   if (event.method === "POST" && !body.user_id) {
     body.user_id = await obterUserId();
     if (!body.user_id) {
-      throw new Error("Identidade indisponível; evento mantido na fila.");
+      throw new SessaoPortalIndisponivelError();
     }
   }
 
@@ -622,9 +831,7 @@ async function enviarEventoPendente(event) {
 
     if (typeof accessToken !== "string" || !accessToken.trim()) {
       registrarRoleWebEvent("não enviada (JWT ausente)");
-      throw new Error(
-        `JWT da sessão do portal indisponível; ${tabelaDestino} não será enviada como anon.`
-      );
+      throw new SessaoPortalIndisponivelError();
     }
 
     let claims;
@@ -646,6 +853,15 @@ async function enviarEventoPendente(event) {
     // PATCH (ex.: fechar inactivity_events) não leva user_id no body:
     // nesse caso valida contra a identidade persistida do portal.
     const userIdEsperado = body.user_id ?? portalUserId;
+    if (
+      typeof body.user_id === "string" &&
+      claims.sub === portalUserId &&
+      body.user_id !== claims.sub
+    ) {
+      registrarRoleWebEvent("não enviada (JWT/user_id incompatíveis)");
+      throw new EventoIncompativelComSessaoError();
+    }
+
     if (
       typeof claims.sub !== "string" ||
       claims.sub !== userIdEsperado ||
@@ -685,6 +901,12 @@ async function enviarEventoPendente(event) {
 
 async function processarOutbox() {
   while (true) {
+    const authState = await validarSessaoPersistida();
+    if (authState.status !== "authenticated") {
+      return;
+    }
+    await identityTransitionOperation;
+
     const event = await obterProximoEventoPendente();
     if (!event) {
       await atualizarStatusSincronizacao();
@@ -704,6 +926,23 @@ async function processarOutbox() {
         lastErrorAt: null
       });
     } catch (error) {
+      if (error instanceof SessaoPortalIndisponivelError) {
+        return;
+      }
+
+      if (error instanceof EventoIncompativelComSessaoError) {
+        await removerEventoEnviado(event);
+        await atualizarStatusSincronizacao({
+          lastError: null,
+          lastErrorAt: null
+        });
+        console.warn(
+          "[Portal Extensão][sync] Evento incompatível com a sessão descartado",
+          { eventId: event.clientEventId, userId: event.body.user_id }
+        );
+        continue;
+      }
+
       await registrarFalhaDeEnvio(event, error);
       console.error(
         "[Portal Extensão][sync] Evento mantido no outbox para nova tentativa",
@@ -960,6 +1199,7 @@ const sessionReady = chrome.storage.local
       );
       await persistirSessao();
     }
+    await validarSessaoPersistida();
     void sincronizarOutbox();
     void atualizarLimiteInatividade();
     const settingsRefreshAlarm = await chrome.alarms.get(
@@ -1774,6 +2014,22 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     return;
   }
 
+  if (alarm.name === PORTAL_AUTH_EXPIRY_ALARM) {
+    void validarSessaoPersistida()
+      .then((authState) => {
+        if (authState.status === "authenticated") {
+          void sincronizarOutbox();
+        }
+      })
+      .catch((error) => {
+        console.error(
+          "[Portal Extensão][auth] Falha ao verificar expiração da sessão",
+          error
+        );
+      });
+    return;
+  }
+
   if (alarm.name === INACTIVITY_SETTINGS_REFRESH_ALARM) {
     void serializarOperacao(() => atualizarLimiteInatividade());
     return;
@@ -1834,6 +2090,27 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.runtime.onMessage.addListener(
   (message, sender, sendResponse) => {
+    if (message?.type === "PORTAL_GET_AUTH_STATE") {
+      if (sender.id !== chrome.runtime.id) {
+        sendResponse({ ok: false });
+        return;
+      }
+
+      void validarSessaoPersistida()
+        .then((authState) => sendResponse({ ok: true, authState }))
+        .catch((error) => {
+          console.error(
+            "[Portal Extensão][auth] Falha ao consultar estado de autenticação",
+            error
+          );
+          sendResponse({
+            ok: false,
+            error: error.message || String(error)
+          });
+        });
+      return true;
+    }
+
     if (
       message?.type !==
       "PORTAL_IDENTITY_CHANGED"
@@ -1917,15 +2194,44 @@ chrome.runtime.onMessage.addListener(
       return;
     }
 
+    if (
+      message.email !== undefined &&
+      message.email !== null &&
+      typeof message.email !== "string"
+    ) {
+      sendResponse({ ok: false, stage: "validation" });
+      return;
+    }
+
+    if (
+      message.expiresAt !== undefined &&
+      message.expiresAt !== null &&
+      (
+        (typeof message.expiresAt !== "number" &&
+          typeof message.expiresAt !== "string") ||
+        converterExpiracaoToken(message.expiresAt) === null
+      )
+    ) {
+      sendResponse({ ok: false, stage: "validation" });
+      return;
+    }
+
     void persistirIdentidade(userId, {
       name: "portal_identity_message",
-      accessToken
+      accessToken,
+      email: message.email ?? null,
+      expiresAt: message.expiresAt ?? null
     })
-      .then((changed) => {
+      .then(async (changed) => {
+        const { [PORTAL_AUTH_STATE_STORAGE_KEY]: authState } =
+          await chrome.storage.local.get(PORTAL_AUTH_STATE_STORAGE_KEY);
         sendResponse({
-          ok: true,
+          ok:
+            userId === null
+              ? authState?.status === "disconnected"
+              : authState?.status === "authenticated",
           stage: changed ? "storage" : "unchanged",
-          ...(userId === null ? { userId: null } : {})
+          authState
         });
       })
       .catch((error) => {

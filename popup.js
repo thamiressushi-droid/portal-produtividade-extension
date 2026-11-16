@@ -46,6 +46,66 @@ function renderizarStatusSincronizacao(status = {}) {
   ].join("\n");
 }
 
+function renderizarEstadoAutenticacao(authState = {}) {
+  const expiresAt = Number(authState.expiresAt);
+  const sessionValid =
+    authState.status === "authenticated" &&
+    typeof authState.userId === "string" &&
+    authState.userId.trim() &&
+    Number.isFinite(expiresAt) &&
+    expiresAt > Date.now();
+  document.getElementById("auth-warning").hidden = Boolean(sessionValid);
+}
+
+async function carregarEstadoAutenticacao() {
+  const { portalAuthState } = await chrome.storage.local.get("portalAuthState");
+  renderizarEstadoAutenticacao(portalAuthState);
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "PORTAL_GET_AUTH_STATE"
+    });
+    if (response?.ok) {
+      renderizarEstadoAutenticacao(response.authState);
+    }
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][popup] Não foi possível consultar a autenticação",
+      error
+    );
+  }
+}
+
+async function conectarAoPortal() {
+  const portalUrl =
+    "https://portal-produtividade.gehaka.workers.dev/";
+  const portalPattern =
+    "https://portal-produtividade.gehaka.workers.dev/*";
+  const connectError = document.getElementById("connect-error");
+  connectError.textContent = "";
+
+  try {
+    const tabs = await chrome.tabs.query({ url: portalPattern });
+    const portalTab = tabs.find((tab) => typeof tab.id === "number");
+
+    if (portalTab) {
+      if (typeof portalTab.windowId === "number") {
+        await chrome.windows.update(portalTab.windowId, { focused: true });
+      }
+      await chrome.tabs.update(portalTab.id, { active: true });
+      return;
+    }
+
+    await chrome.tabs.create({ url: portalUrl });
+  } catch (error) {
+    console.error(
+      "[Portal Extensão][popup] Não foi possível abrir o portal",
+      error
+    );
+    connectError.textContent = "Não foi possível abrir o portal.";
+  }
+}
+
 function renderizarDiagnosticoCaptura(diagnostics = {}) {
   const campos = [
     ["diagnostic-url", diagnostics.url],
@@ -79,7 +139,11 @@ async function carregarDiagnosticoCaptura() {
 
 carregarRegistros();
 carregarStatusSincronizacao();
+carregarEstadoAutenticacao();
 carregarDiagnosticoCaptura();
+document
+  .getElementById("connect-portal")
+  .addEventListener("click", () => void conectarAoPortal());
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") {
@@ -88,6 +152,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
   if (changes.syncStatus) {
     renderizarStatusSincronizacao(changes.syncStatus.newValue);
+  }
+  if (changes.portalAuthState) {
+    renderizarEstadoAutenticacao(changes.portalAuthState.newValue);
   }
   if (changes.captureDiagnostics) {
     renderizarDiagnosticoCaptura(changes.captureDiagnostics.newValue);

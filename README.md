@@ -29,6 +29,9 @@ indisponibilidade do Supabase ou ausência de identidade mantêm os eventos na
 fila para novas tentativas. O alarme periódico retoma o envio após reiniciar o
 navegador; IDs idempotentes e a migration
 `20261030140000_add_client_event_ids.sql` evitam duplicações no servidor.
+Ao trocar de conta, eventos pendentes cujo `user_id` não corresponde ao JWT da
+sessão atual são descartados individualmente quando a identidade salva e o JWT
+confirmam a nova sessão; os demais eventos continuam sendo processados.
 
 A identidade autenticada é persistida em `chrome.storage.local` e recuperada
 após reiniciar o navegador. Se ela ainda não estiver salva, o background
@@ -45,6 +48,58 @@ cabeçalho `Authorization: Bearer` e só são feitas quando ele declara a role
 mantida no outbox em vez de usar a role `anon`. A role usada ou o motivo do
 bloqueio aparece nos logs da extensão e no status do popup. As demais chamadas
 Supabase permanecem inalteradas.
+
+O content script escuta mensagens `postMessage` estruturadas do portal com
+`source: "portal-produtividade-auth"`. O portal deve emitir `SESSION_SYNC`
+com `accessToken` e `userId` para `SIGNED_IN`, `TOKEN_REFRESHED` e
+`INITIAL_SESSION` com sessão válida, e `SESSION_CLEARED` quando a sessão for
+nula ou ocorrer `SIGNED_OUT`. Por exemplo, registre este listener no código do
+portal depois de criar o cliente Supabase:
+
+```js
+supabase.auth.onAuthStateChange((event, session) => {
+  if (!session) {
+    window.postMessage(
+      { source: "portal-produtividade-auth", type: "SESSION_CLEARED" },
+      window.location.origin
+    );
+    return;
+  }
+
+  if (
+    ["SIGNED_IN", "TOKEN_REFRESHED", "INITIAL_SESSION"].includes(event) &&
+    session.access_token &&
+    session.user?.id
+  ) {
+    window.postMessage(
+      {
+        source: "portal-produtividade-auth",
+        type: "SESSION_SYNC",
+        accessToken: session.access_token,
+        userId: session.user.id,
+        email: session.user.email ?? null,
+        expiresAt: session.expires_at ?? null
+      },
+      window.location.origin
+    );
+  }
+});
+```
+
+O evento `INITIAL_SESSION` sincroniza automaticamente uma sessão já ativa
+quando o listener de autenticação é registrado; o bridge da extensão é
+carregado em `document_start` para estar pronto para recebê-lo. Mensagens da
+página sem o `source` esperado são ignoradas; a leitura de `localStorage` e a
+consulta do background continuam disponíveis como recuperação da sessão.
+
+O background centraliza o estado em `portalAuthState`, persiste a nova
+identidade e o JWT juntos, e só retoma o outbox depois de confirmar a troca de
+usuário. `SESSION_CLEARED` remove as credenciais e pausa o envio. A validade é
+verificada pelos claims `role`, `sub` e `exp` do JWT, além de `expiresAt` quando
+informado pelo portal; um alarme marca a sessão expirada mesmo com o popup
+fechado, e a fila revalida o estado antes de cada envio. O popup mostra
+`⚠️ Sessão desconectada ou expirada` se não houver uma sessão válida e permite
+focar uma aba existente ou abrir o Portal pelo botão `Conectar ao Portal`.
 
 As gravações e atualizações de `inactivity_events` também usam o JWT autenticado.
 A migration `20261030193200_reconcile_inactivity_event_permissions.sql`
