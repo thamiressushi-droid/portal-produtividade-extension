@@ -260,6 +260,8 @@ const PRIVATE_APPLICATIONS = [
 ];
 
 let currentSession = null;
+let recoveredSessionStart = null;
+let recoveredSessionBoundary = null;
 let inactivityThresholdSeconds = null;
 const HEARTBEAT_INTERVAL_MS = 30 * 1000;
 const HEARTBEAT_TOLERANCE_MS = 5 * 60 * 1000;
@@ -294,6 +296,7 @@ let monitorState = {
   continuityInterruptedAt: null
 };
 let sessionOperation = Promise.resolve();
+let sessionInitializationComplete = false;
 let outboxDatabasePromise;
 let synchronizationOperation = Promise.resolve();
 let authenticationOperation = Promise.resolve();
@@ -986,6 +989,14 @@ async function processarOutbox() {
 }
 
 function sincronizarOutbox() {
+  if (!sessionInitializationComplete) {
+    return sessionReady.then(() => {
+      if (sessionInitializationComplete) {
+        return sincronizarOutbox();
+      }
+    });
+  }
+
   synchronizationOperation = synchronizationOperation
     .then(() => processarOutbox())
     .catch((error) => {
@@ -1164,52 +1175,58 @@ async function atualizarLimiteInatividade() {
         );
       }
     }
+    console.error(
+      "[Portal Extensão][background] Não foi possível atualizar o limite de inatividade; usando último valor válido",
+      error
+    );
+  }
+}
 
-    function parseTimeOfDay(value, fallback) {
-      if (typeof value !== "string") return fallback;
-      const normalized = value.trim().replace(/^(\d{1,2})h(\d{2})$/i, "$1:$2");
-      const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(normalized);
-      return match ? `${match[1].padStart(2, "0")}:${match[2]}` : fallback;
-    }
+function parseTimeOfDay(value, fallback) {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().replace(/^(\d{1,2})h(\d{2})$/i, "$1:$2");
+  const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(normalized);
+  return match ? `${match[1].padStart(2, "0")}:${match[2]}` : fallback;
+}
 
-    function minutesSinceMidnight(time) {
-      const [hours, minutes] = time.split(":").map(Number);
-      return hours * 60 + minutes;
-    }
+function minutesSinceMidnight(time) {
+  const [hours, minutes] = time.split(":").map(Number);
+  return hours * 60 + minutes;
+}
 
-    function obterHorarioLocal(timestamp = Date.now()) {
-      const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: journeySettings.timezone || DEFAULT_JOURNEY_SETTINGS.timezone,
-        weekday: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hourCycle: "h23"
-      }).formatToParts(new Date(timestamp));
-      const value = {};
-      for (const part of parts) value[part.type] = part.value;
-      const weekdays = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-      return {
-        day: weekdays[value.weekday] ?? new Date(timestamp).getDay(),
-        minutes: Number(value.hour) * 60 + Number(value.minute)
-      };
-    }
+function obterHorarioLocal(timestamp = Date.now()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: journeySettings.timezone || DEFAULT_JOURNEY_SETTINGS.timezone,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(new Date(timestamp));
+  const value = {};
+  for (const part of parts) value[part.type] = part.value;
+  const weekdays = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return {
+    day: weekdays[value.weekday] ?? new Date(timestamp).getDay(),
+    minutes: Number(value.hour) * 60 + Number(value.minute)
+  };
+}
 
-    function obterTipoJornada(timestamp = Date.now()) {
-      const local = obterHorarioLocal(timestamp);
-      if (!journeySettings.workDays.includes(local.day)) {
-        return "outside";
-      }
-      const start = minutesSinceMidnight(journeySettings.workStart);
-      const lunchStart = minutesSinceMidnight(journeySettings.lunchStart);
-      const lunchEnd = minutesSinceMidnight(journeySettings.lunchEnd);
-      const end = minutesSinceMidnight(journeySettings.workEnd);
-      if (local.minutes >= start && local.minutes < lunchStart) return "regular";
-      if (local.minutes >= lunchStart && local.minutes < lunchEnd) return "lunch";
-      if (local.minutes >= lunchEnd && local.minutes < end) return "regular";
-      if (local.minutes >= end) return "exceptional";
-      return "outside";
-    }
+function obterTipoJornada(timestamp = Date.now()) {
+  const local = obterHorarioLocal(timestamp);
+  if (!journeySettings.workDays.includes(local.day)) {
+    return "outside";
+  }
+  const start = minutesSinceMidnight(journeySettings.workStart);
+  const lunchStart = minutesSinceMidnight(journeySettings.lunchStart);
+  const lunchEnd = minutesSinceMidnight(journeySettings.lunchEnd);
+  const end = minutesSinceMidnight(journeySettings.workEnd);
+  if (local.minutes >= start && local.minutes < lunchStart) return "regular";
+  if (local.minutes >= lunchStart && local.minutes < lunchEnd) return "lunch";
+  if (local.minutes >= lunchEnd && local.minutes < end) return "regular";
+  if (local.minutes >= end) return "exceptional";
+  return "outside";
+}
 
 function extrairConfiguracoesAdministrativas(payload) {
   const rows = Array.isArray(payload)
@@ -1348,15 +1365,24 @@ async function atualizarConfiguracoesAdministrativas() {
   }
 }
 
-    async function persistirEstadoMonitoramento() {
-      await chrome.storage.local.set({ monitorState });
-    }
+async function persistirEstadoMonitoramento() {
+  await chrome.storage.local.set({ monitorState });
+}
 
-    async function confirmarHeartbeat(timestamp = Date.now()) {
-      monitorState.lastHeartbeatAt = new Date(timestamp).toISOString();
-      await persistirEstadoMonitoramento();
-      await chrome.alarms.create(HEARTBEAT_ALARM, { delayInMinutes: 0.5 });
-    }
+async function confirmarHeartbeat(timestamp = Date.now()) {
+  const heartbeatAt = new Date(timestamp).toISOString();
+  monitorState.lastHeartbeatAt = heartbeatAt;
+  if (currentSession) {
+    currentSession.lastHeartbeatAt = heartbeatAt;
+    await chrome.storage.local.set({
+      monitorState,
+      activeSession: currentSession
+    });
+  } else {
+    await persistirEstadoMonitoramento();
+  }
+  await chrome.alarms.create(HEARTBEAT_ALARM, { delayInMinutes: 0.5 });
+}
 
 async function agendarHeartbeatSupabase(frequencySeconds) {
   const seconds = Number(frequencySeconds);
@@ -1445,43 +1471,73 @@ async function enviarHeartbeatSupabase() {
   }
 }
 
-    async function validarContinuidade(now = Date.now()) {
-      const previous = monitorState.lastHeartbeatAt
-        ? new Date(monitorState.lastHeartbeatAt).getTime()
-        : null;
-      if (previous !== null && now - previous > HEARTBEAT_TOLERANCE_MS) {
-        const confirmedEnd = previous;
-        monitorState.continuityInterruptedAt = new Date(now).toISOString();
-        if (currentSession) {
-          await encerrarSessao(confirmedEnd, "monitoring_continuity_gap");
-          monitorState.exceptionalStatus = "none";
-        }
-        if (monitorState.exceptionalStatus !== "none") {
-          monitorState.exceptionalStatus = "ended";
-          monitorState.exceptionalEndedAt = new Date(confirmedEnd).toISOString();
-          monitorState.exceptionalEndReason = "monitoring_continuity_gap";
-        }
-        await persistirEstadoMonitoramento();
-      }
-      if (
-        obterTipoJornada(now) === "lunch" &&
-        currentSession?.inactivityStartedAt
-      ) {
-        await finalizarEventoInatividade(now);
-        currentSession.intervalStart = new Date(now).toISOString();
-        currentSession.isActive = true;
-        await persistirSessao();
-        await chrome.alarms.clear(INACTIVITY_ALARM);
-      }
-      await confirmarHeartbeat(now);
-      return true;
-    }
-
-    console.error(
-      "[Portal Extensão][background] Não foi possível atualizar o limite de inatividade; usando último valor válido",
-      error
-    );
+function obterUltimoInstanteMonitorado(sessao = currentSession, now = Date.now()) {
+  const persistedHeartbeat = Date.parse(monitorState.lastHeartbeatAt || "");
+  const sessionHeartbeat = Date.parse(sessao?.lastHeartbeatAt || "");
+  const heartbeatCandidates = [persistedHeartbeat, sessionHeartbeat]
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp <= now);
+  if (heartbeatCandidates.length) {
+    return Math.min(...heartbeatCandidates);
   }
+
+  const sessionEvidence = [
+    sessao?.lastActivity,
+    sessao?.intervalStart,
+    sessao?.inicio
+  ]
+    .map((timestamp) => Date.parse(timestamp || ""))
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp <= now);
+  return sessionEvidence.length ? Math.max(...sessionEvidence) : null;
+}
+
+async function validarContinuidade(now = Date.now()) {
+  const previous = obterUltimoInstanteMonitorado(currentSession, now);
+  const continuityUnconfirmed = Boolean(currentSession) &&
+    ![monitorState.lastHeartbeatAt, currentSession.lastHeartbeatAt].some(
+      (timestamp) => {
+        const parsed = Date.parse(timestamp || "");
+        return Number.isFinite(parsed) && parsed <= now;
+      }
+    );
+  if (
+    currentSession &&
+    (continuityUnconfirmed ||
+      (previous !== null && now - previous > HEARTBEAT_TOLERANCE_MS))
+  ) {
+    const sessionStart = Date.parse(currentSession.inicio || "");
+    const confirmedEnd = previous ?? sessionStart;
+    monitorState.continuityInterruptedAt = new Date(now).toISOString();
+    if (Number.isFinite(confirmedEnd)) {
+      await encerrarSessao(
+        confirmedEnd,
+        continuityUnconfirmed
+          ? "monitoring_continuity_unconfirmed"
+          : "monitoring_continuity_gap"
+      );
+    } else {
+      console.warn(
+        "[Portal Extensão][heartbeat] Sessão persistida descartada sem timestamp confiável",
+        { reason: "monitoring_continuity_unconfirmed" }
+      );
+      currentSession = null;
+      await persistirSessao();
+      await chrome.alarms.clear(INACTIVITY_ALARM);
+    }
+    monitorState.exceptionalStatus = "none";
+    await persistirEstadoMonitoramento();
+  }
+  if (
+    obterTipoJornada(now) === "lunch" &&
+    currentSession?.inactivityStartedAt
+  ) {
+    await finalizarEventoInatividade(now);
+    currentSession.intervalStart = new Date(now).toISOString();
+    currentSession.isActive = true;
+    await persistirSessao();
+    await chrome.alarms.clear(INACTIVITY_ALARM);
+  }
+  await confirmarHeartbeat(now);
+  return true;
 }
 
 const sessionReady = chrome.storage.local
@@ -1524,9 +1580,6 @@ const sessionReady = chrome.storage.local
     ) {
       journeySettings.exceptionalToleranceMinutes = cachedExceptionalMinutes;
     }
-    if (!monitorState.lastHeartbeatAt) {
-      await confirmarHeartbeat();
-    }
     currentSession = activeSession
       ? {
           ...activeSession,
@@ -1534,6 +1587,13 @@ const sessionReady = chrome.storage.local
           isActive: activeSession.isActive !== false
         }
       : null;
+
+    recoveredSessionStart = currentSession?.inicio || null;
+    recoveredSessionBoundary = obterUltimoInstanteMonitorado(
+      currentSession,
+      Date.now()
+    );
+    await validarContinuidade();
 
     if (currentSession) {
       if (!Object.hasOwn(currentSession, "userId")) {
@@ -1582,10 +1642,7 @@ const sessionReady = chrome.storage.local
     await chrome.alarms.create(JOURNEY_SETTINGS_REFRESH_ALARM, {
       periodInMinutes: 5
     });
-    if (
-      currentSession?.inactivityStartedAt &&
-      currentSession.inactivityClientEventId
-    ) {
+    if (currentSession?.inactivityStartedAt && currentSession.inactivityClientEventId) {
       await enviarEventoInatividade(
         currentSession,
         currentSession.inactivityStartedAt,
@@ -1594,6 +1651,7 @@ const sessionReady = chrome.storage.local
       await persistirSessao();
     }
     await validarSessaoPersistida();
+    sessionInitializationComplete = true;
     void sincronizarOutbox();
     void atualizarLimiteInatividade();
     void atualizarConfiguracoesAdministrativas();
@@ -2096,8 +2154,20 @@ async function finalizarEventoInatividade(endedAt) {
   }
 
   const startedAt = currentSession.inactivityStartedAt;
-  const endedAtIso = currentSession.inactivityEndedAt ||
-    new Date(endedAt).toISOString();
+  const startedAtMs = Date.parse(startedAt);
+  const requestedEndMs = Number(endedAt);
+  const previouslyRecordedEndMs = Date.parse(
+    currentSession.inactivityEndedAt || ""
+  );
+  const cappedEndMs = Number.isFinite(previouslyRecordedEndMs)
+    ? Math.min(previouslyRecordedEndMs, requestedEndMs)
+    : requestedEndMs;
+  const endedAtIso = new Date(
+    Math.max(
+      Number.isFinite(startedAtMs) ? startedAtMs : 0,
+      Number.isFinite(cappedEndMs) ? cappedEndMs : Date.now()
+    )
+  ).toISOString();
   currentSession.inactivityEndedAt = endedAtIso;
   await persistirSessao();
 
@@ -2505,7 +2575,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === OUTBOX_SYNC_ALARM) {
-    void sincronizarOutbox();
+    void sessionReady.then(() => sincronizarOutbox());
     return;
   }
 
@@ -2550,8 +2620,25 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   void serializarOperacao(async () => {
+    const lastConfirmedHeartbeat = obterUltimoInstanteMonitorado(
+      currentSession,
+      Date.now()
+    );
     await validarContinuidade();
     if (!currentSession) {
+      return;
+    }
+    if (
+      Number.isFinite(alarm.scheduledTime) &&
+      Date.now() - alarm.scheduledTime > HEARTBEAT_TOLERANCE_MS
+    ) {
+      await encerrarSessao(
+        Math.min(
+          lastConfirmedHeartbeat ?? Date.now(),
+          alarm.scheduledTime
+        ),
+        "delayed_inactivity_alarm"
+      );
       return;
     }
     const jornada = obterTipoJornada(Date.now());
@@ -2613,15 +2700,16 @@ chrome.idle.onStateChanged.addListener((state) => {
 
 chrome.runtime.onStartup.addListener(() => {
   void serializarOperacao(async () => {
-    if (!currentSession) {
+    if (
+      !currentSession ||
+      !recoveredSessionStart ||
+      currentSession.inicio !== recoveredSessionStart
+    ) {
       return;
     }
-    await validarContinuidade();
     if (currentSession) {
       await encerrarSessao(
-        monitorState.lastHeartbeatAt
-          ? new Date(monitorState.lastHeartbeatAt).getTime()
-          : new Date(currentSession.lastActivity).getTime(),
+        recoveredSessionBoundary ?? Date.parse(currentSession.lastActivity),
         "browser_startup"
       );
     }

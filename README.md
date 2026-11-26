@@ -1,7 +1,17 @@
 # portal-produtividade-extension
 Plugin do navegador
 
-Versão final desta integração: **1.2.0**.
+Versão desta integração: **1.2.1**.
+
+### Histórico de versões
+
+- **1.2.1:** corrige a recuperação de sessões após lacunas sem monitoramento.
+  O encerramento usa o último heartbeat confirmado; sessões legadas sem
+  heartbeat usam o último horário de atividade conhecido. A inicialização
+  valida a continuidade antes de reenviar eventos pendentes, e alarmes
+  atrasados não geram inatividade retroativa. Inclui testes automatizados para
+  lacunas curtas, longas, sessões antigas, reinicialização e eventos pendentes.
+- **1.2.0:** versão anterior da integração.
 
 ## Monitoramento inteligente
 
@@ -20,8 +30,13 @@ Versão final desta integração: **1.2.0**.
 A extensão mantém uma confirmação local a cada 30 segundos e persiste o último
 heartbeat válido. Uma lacuna maior que cinco minutos encerra o segmento apenas
 até o último instante confirmado; não estima atividade ou inatividade durante
-a lacuna. Alarmes atrasados e suspensão do service worker não são presumidos
-como hibernação, apenas a tolerância temporal define a interrupção.
+a lacuna. Na recuperação de sessões anteriores, a continuidade é validada antes
+de rearmar alarmes ou reenviar eventos pendentes. Se uma sessão legada não tiver
+heartbeat persistido, ela é encerrada no último horário de atividade conhecido,
+sem usar o horário da retomada como fim. Alarmes de inatividade atrasados além
+da tolerância encerram no máximo no horário programado e não criam inatividade
+retroativa. A retomada do service worker, isoladamente, não interrompe uma
+sessão: lacunas de até cinco minutos permanecem dentro da tolerância técnica.
 
 A jornada usa cache local e carrega periodicamente as configurações reais da
 tabela `settings` com o JWT autenticado da extensão: `work_journey`,
@@ -49,8 +64,13 @@ inatividade é lido da tabela `settings`, na chave
 limite, a extensão registra o intervalo em `web_events` e abre um evento em
 `inactivity_events`; ao retornar a atividade, finaliza esse evento. O último
 limite válido fica em cache local para uso temporário se o Supabase estiver
-indisponível. Uma sessão pendente é recuperada sem contabilizar o período em que
-o navegador esteve fechado.
+indisponível. Uma sessão pendente só é continuada após validar o heartbeat
+local; períodos sem monitoramento confirmado não são contabilizados. Eventos
+pendentes de inatividade são encerrados no último instante monitorado antes de
+serem reenviados.
+
+Os cenários de recuperação e continuidade são cobertos por
+`node --test tests/background-continuity.test.js`.
 
 No Protheus/TOTVS, o módulo `content-protheus.js` identifica a rotina pela aba
 ativa (`wa-tab-button[active]`) e o contexto visível pelo atributo `caption` de
