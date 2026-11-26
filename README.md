@@ -1,6 +1,47 @@
 # portal-produtividade-extension
 Plugin do navegador
 
+Versão final desta integração: **1.2.0**.
+
+## Monitoramento inteligente
+
+### Mecanismos independentes
+
+1. **Inatividade humana:** `inactivity_threshold_minutes` permanece
+   administrativo e atualmente configurado em 3 minutos. Durante o expediente
+   regular, esse limite cria eventos de inatividade, mas não encerra a sessão.
+2. **Encerramento excepcional:** após o horário configurado de saída, a
+   ausência consecutiva de interação encerra a sessão após 10 minutos. Esse
+   prazo não usa nem altera o limite de 3 minutos.
+3. **Heartbeat:** confirma continuidade técnica a cada 30 segundos. Heartbeats
+   não são atividade humana e gaps maiores que cinco minutos encerram apenas até
+   o último instante confirmado, sem retroatividade.
+
+A extensão mantém uma confirmação local a cada 30 segundos e persiste o último
+heartbeat válido. Uma lacuna maior que cinco minutos encerra o segmento apenas
+até o último instante confirmado; não estima atividade ou inatividade durante
+a lacuna. Alarmes atrasados e suspensão do service worker não são presumidos
+como hibernação, apenas a tolerância temporal define a interrupção.
+
+A jornada usa cache local e carrega periodicamente as configurações reais da
+tabela `settings` com o JWT autenticado da extensão: `work_journey`,
+`inactivity_threshold_minutes`, `post_work_inactivity_tolerance_minutes`,
+`heartbeat_frequency_seconds` e `activities_module_enabled`. O fallback local
+inicial é entrada 08:12, almoço 12:00–13:00, saída 18:00, segunda a sexta,
+America/Sao_Paulo, inatividade de 3 minutos e tolerância excepcional de 10
+minutos. O campo `effective_from` da jornada é respeitado.
+
+Após o horário de saída, uma interação abre uma confirmação via notificação ou
+pelas ações do popup. Sem confirmação, a extensão encerra o segmento após a
+tolerância excepcional e não presume automaticamente atividade contínua.
+Trocas automáticas de página e aba não iniciam monitoramento por si só.
+
+Os contratos de banco utilizados continuam em `web_events`,
+`inactivity_events`, `settings` e `extension_heartbeats`. O heartbeat do
+Supabase é enviado autenticado com o JWT do usuário e a versão do manifest,
+sem histórico retroativo. O último heartbeat confirmado pelo servidor é
+diferenciado da confirmação técnica local.
+
 Os intervalos de navegação são registrados como ativos enquanto houver
 interação recente do usuário (mouse, teclado, rolagem ou clique). O limite de
 inatividade é lido da tabela `settings`, na chave

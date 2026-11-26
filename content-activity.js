@@ -70,9 +70,9 @@
       ? { screenName: privateApplicationName, screenContext: null }
       : protheusScreen;
     const diagnostics = {
-      url: location.href,
-      tab_title: document.title || null,
-      window_title: document.title || null,
+      url: privateApplicationName ? location.origin : location.href,
+      tab_title: privateApplicationName ? privateApplicationName : document.title || null,
+      window_title: privateApplicationName ? privateApplicationName : document.title || null,
       screen_name: capturedScreen.screenName,
       screen_context: capturedScreen.screenContext,
       capturedAt: new Date().toISOString(),

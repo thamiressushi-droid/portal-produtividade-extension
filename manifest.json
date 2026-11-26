@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Portal Produtividade",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Monitoramento de sites ativos para o Portal de Produtividade.",
 
   "permissions": [
@@ -10,7 +10,8 @@
     "storage",
     "unlimitedStorage",
     "alarms",
-    "idle"
+    "idle",
+    "notifications"
   ],
 
   "host_permissions": [

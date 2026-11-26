@@ -38,6 +38,7 @@ function formatarData(valor) {
 function renderizarStatusSincronizacao(status = {}) {
   const elemento = document.getElementById("sync-status");
   elemento.textContent = [
+    `Conexão com Supabase: ${status.supabaseConnectionStatus === "connected" ? "conectado" : "desconectado"}`,
     `Eventos pendentes: ${status.pendingCount ?? 0}`,
     `Role usada em web_events: ${status.lastWebEventRole || "Aguardando requisição"}`,
     `Role usada em inactivity_events: ${status.lastInactivityEventRole || "Aguardando requisição"}`,
@@ -137,13 +138,66 @@ async function carregarDiagnosticoCaptura() {
   renderizarDiagnosticoCaptura(captureDiagnostics);
 }
 
+function renderizarStatusMonitoramento(status = {}) {
+  const session = status.session;
+  const monitorState = status.monitorState || {};
+  const journey = status.journeySettings || {};
+  const lines = [
+    `Monitoramento: ${session ? "ativo" : "encerrado"}`,
+    `Tipo: ${session ? (monitorState.exceptionalStatus === "confirmed" ? "excepcional confirmado" : status.journeyType || "regular") : "não iniciado"}`,
+    `Supabase heartbeat: ${monitorState.supabaseHeartbeatStatus === "connected" ? "confirmado" : "não confirmado"}`,
+    `Último heartbeat confirmado: ${formatarData(monitorState.lastSupabaseHeartbeatAt)}`,
+    `Frequência heartbeat: ${monitorState.heartbeatFrequencySeconds || 30} segundos`,
+    `Início da sessão: ${formatarData(session?.inicio)}`,
+    `Último heartbeat válido: ${formatarData(monitorState.lastHeartbeatAt)}`,
+    `Última interação: ${formatarData(monitorState.lastInteractionAt)}`,
+    `Jornada: ${journey.workStart || "08:12"}–${journey.workEnd || "18:00"}`,
+    `Almoço: ${journey.lunchStart || "12:00"}–${journey.lunchEnd || "13:00"}`
+  ];
+  document.getElementById("monitor-status").textContent = lines.join("\n");
+  document.getElementById("exceptional-actions").hidden =
+    monitorState.exceptionalStatus !== "pending";
+}
+
+function obterTipoJornadaTexto() {
+  return "regular";
+}
+
+async function carregarStatusMonitoramento() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "PORTAL_GET_MONITOR_STATUS"
+    });
+    if (response?.ok) {
+      renderizarStatusMonitoramento(response.status);
+    }
+  } catch (error) {
+    document.getElementById("monitor-status").textContent =
+      "Monitoramento: indisponível";
+  }
+}
+
+async function responderEncerramento(type) {
+  await chrome.runtime.sendMessage({ type });
+  await carregarStatusMonitoramento();
+}
+
 carregarRegistros();
 carregarStatusSincronizacao();
 carregarEstadoAutenticacao();
 carregarDiagnosticoCaptura();
+carregarStatusMonitoramento();
 document
   .getElementById("connect-portal")
   .addEventListener("click", () => void conectarAoPortal());
+document
+  .getElementById("exceptional-confirm")
+  .addEventListener("click", () =>
+    void responderEncerramento("PORTAL_EXCEPTIONAL_CONFIRM"));
+document
+  .getElementById("exceptional-end")
+  .addEventListener("click", () =>
+    void responderEncerramento("PORTAL_EXCEPTIONAL_END"));
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") {
@@ -158,5 +212,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
   if (changes.captureDiagnostics) {
     renderizarDiagnosticoCaptura(changes.captureDiagnostics.newValue);
+  }
+  if (changes.monitorState) {
+    void carregarStatusMonitoramento();
   }
 });

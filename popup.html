@@ -81,6 +81,19 @@
       color: #555;
       font-size: 12px;
     }
+
+    #monitor-status {
+      margin-bottom: 12px;
+      padding: 8px;
+      background: #eef6ff;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+
+    #exceptional-actions button {
+      margin: 6px 6px 0 0;
+      padding: 7px 10px;
+    }
   </style>
 </head>
 <body>
@@ -91,6 +104,12 @@
     <strong>⚠️ Sessão desconectada ou expirada</strong><br>
     <button id="connect-portal" type="button">Conectar ao Portal</button>
     <span id="connect-error" role="status"></span>
+  </section>
+  <section id="monitor-status" aria-live="polite"></section>
+  <section id="exceptional-actions" aria-live="polite" hidden>
+    <strong>Encerramento do expediente</strong><br>
+    <button id="exceptional-confirm" type="button">Sim, continuar monitoramento</button>
+    <button id="exceptional-end" type="button">Não, encerrar expediente</button>
   </section>
   <section id="sync-status" aria-live="polite"></section>
   <section id="capture-diagnostics" aria-live="polite">

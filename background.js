@@ -261,6 +261,38 @@ const PRIVATE_APPLICATIONS = [
 
 let currentSession = null;
 let inactivityThresholdSeconds = null;
+const HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const HEARTBEAT_TOLERANCE_MS = 5 * 60 * 1000;
+const EXCEPTIONAL_TIMEOUT_MINUTES = 10;
+const HEARTBEAT_ALARM = "portal-monitoring-heartbeat";
+const SUPABASE_HEARTBEAT_ALARM = "portal-supabase-heartbeat";
+const JOURNEY_SETTINGS_REFRESH_ALARM = "portal-journey-settings-refresh";
+const EXCEPTIONAL_CONFIRMATION_ALARM = "portal-exceptional-confirmation";
+const NOTIFICATION_ID = "portal-exceptional-work";
+const DEFAULT_JOURNEY_SETTINGS = {
+  workStart: "08:12",
+  lunchStart: "12:00",
+  lunchEnd: "13:00",
+  workEnd: "18:00",
+  workDays: [1, 2, 3, 4, 5],
+  timezone: "America/Sao_Paulo",
+  exceptionalToleranceMinutes: 10
+};
+let journeySettings = { ...DEFAULT_JOURNEY_SETTINGS };
+let monitorState = {
+  lastHeartbeatAt: null,
+  lastSupabaseHeartbeatAt: null,
+  lastSupabaseHeartbeatError: null,
+  supabaseHeartbeatStatus: "disconnected",
+  heartbeatFrequencySeconds: 30,
+  lastInteractionAt: null,
+  exceptionalStatus: "none",
+  exceptionalPromptShownForSession: null,
+  exceptionalConfirmedAt: null,
+  exceptionalEndedAt: null,
+  exceptionalEndReason: null,
+  continuityInterruptedAt: null
+};
 let sessionOperation = Promise.resolve();
 let outboxDatabasePromise;
 let synchronizationOperation = Promise.resolve();
@@ -1133,6 +1165,318 @@ async function atualizarLimiteInatividade() {
       }
     }
 
+    function parseTimeOfDay(value, fallback) {
+      if (typeof value !== "string") return fallback;
+      const normalized = value.trim().replace(/^(\d{1,2})h(\d{2})$/i, "$1:$2");
+      const match = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(normalized);
+      return match ? `${match[1].padStart(2, "0")}:${match[2]}` : fallback;
+    }
+
+    function minutesSinceMidnight(time) {
+      const [hours, minutes] = time.split(":").map(Number);
+      return hours * 60 + minutes;
+    }
+
+    function obterHorarioLocal(timestamp = Date.now()) {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: journeySettings.timezone || DEFAULT_JOURNEY_SETTINGS.timezone,
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23"
+      }).formatToParts(new Date(timestamp));
+      const value = {};
+      for (const part of parts) value[part.type] = part.value;
+      const weekdays = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      return {
+        day: weekdays[value.weekday] ?? new Date(timestamp).getDay(),
+        minutes: Number(value.hour) * 60 + Number(value.minute)
+      };
+    }
+
+    function obterTipoJornada(timestamp = Date.now()) {
+      const local = obterHorarioLocal(timestamp);
+      if (!journeySettings.workDays.includes(local.day)) {
+        return "outside";
+      }
+      const start = minutesSinceMidnight(journeySettings.workStart);
+      const lunchStart = minutesSinceMidnight(journeySettings.lunchStart);
+      const lunchEnd = minutesSinceMidnight(journeySettings.lunchEnd);
+      const end = minutesSinceMidnight(journeySettings.workEnd);
+      if (local.minutes >= start && local.minutes < lunchStart) return "regular";
+      if (local.minutes >= lunchStart && local.minutes < lunchEnd) return "lunch";
+      if (local.minutes >= lunchEnd && local.minutes < end) return "regular";
+      if (local.minutes >= end) return "exceptional";
+      return "outside";
+    }
+
+function extrairConfiguracoesAdministrativas(payload) {
+  const rows = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.data)
+      ? payload.data
+      : [];
+  const map = new Map();
+  for (const row of rows) {
+    if (row?.key && Object.hasOwn(row, "value")) {
+      map.set(String(row.key), row.value);
+    }
+  }
+  if (!map.size) return null;
+
+  const journey = map.get("work_journey");
+  const journeyObject = journey && typeof journey === "object"
+    ? journey
+    : null;
+  const effectiveFrom = typeof journeyObject?.effective_from === "string"
+    ? journeyObject.effective_from
+    : null;
+
+  const inactivityMinutes = Number(map.get("inactivity_threshold_minutes"));
+  const exceptionalMinutes = Number(map.get("post_work_inactivity_tolerance_minutes"));
+  const heartbeatSeconds = Number(map.get("heartbeat_frequency_seconds"));
+
+  return {
+    journey: journeyObject,
+    effectiveFrom,
+    inactivityMinutes: Number.isFinite(inactivityMinutes) && inactivityMinutes > 0
+      ? inactivityMinutes
+      : 3,
+    exceptionalToleranceMinutes: Number.isFinite(exceptionalMinutes) && exceptionalMinutes > 0
+      ? exceptionalMinutes
+      : 10,
+    heartbeatFrequencySeconds: Number.isFinite(heartbeatSeconds) && heartbeatSeconds >= 5
+      ? heartbeatSeconds
+      : 30,
+    activitiesModuleEnabled: map.get("activities_module_enabled") === true
+  };
+}
+
+async function atualizarConfiguracoesAdministrativas() {
+  try {
+    const authState = await validarSessaoPersistida();
+    if (authState.status !== "authenticated") {
+      throw new Error("Autenticação indisponível para ler settings.");
+    }
+    const { portalAccessToken } = await chrome.storage.local.get(
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY
+    );
+    if (!portalAccessToken) {
+      throw new Error("Token autenticado indisponível para ler settings.");
+    }
+
+    const keys = [
+      "inactivity_threshold_minutes",
+      "post_work_inactivity_tolerance_minutes",
+      "heartbeat_frequency_seconds",
+      "activities_module_enabled",
+      "work_journey"
+    ];
+    const query = `select=key,value&key=in.(${keys.map(encodeURIComponent).join(",")})&limit=100`;
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/settings?${query}`,
+      {
+        headers: {
+          "apikey": SUPABASE_KEY,
+          "Authorization": `Bearer ${portalAccessToken}`
+        }
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`Leitura de settings falhou: ${response.status}`);
+    }
+
+    const settings = await response.json();
+    const administrative = extrairConfiguracoesAdministrativas(settings);
+    if (!administrative) {
+      throw new Error("Nenhuma configuração administrativa válida retornada.");
+    }
+
+    const journeyObject = administrative.effectiveFrom
+      ? administrative.journey
+      : null;
+    const canApplyJourney = !administrative.effectiveFrom ||
+      administrative.effectiveFrom <= new Date().toISOString().slice(0, 10);
+    if (journeyObject && canApplyJourney) {
+      journeySettings = {
+        workStart: parseTimeOfDay(journeyObject.entry, DEFAULT_JOURNEY_SETTINGS.workStart),
+        lunchStart: parseTimeOfDay(journeyObject.lunch_start, DEFAULT_JOURNEY_SETTINGS.lunchStart),
+        lunchEnd: parseTimeOfDay(journeyObject.lunch_end, DEFAULT_JOURNEY_SETTINGS.lunchEnd),
+        workEnd: parseTimeOfDay(journeyObject.exit, DEFAULT_JOURNEY_SETTINGS.workEnd),
+        workDays: Array.isArray(journeyObject.workdays)
+          ? journeyObject.workdays
+              .map(Number)
+              .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
+          : [...DEFAULT_JOURNEY_SETTINGS.workDays],
+        timezone: typeof journeyObject.timezone === "string"
+          ? journeyObject.timezone
+          : DEFAULT_JOURNEY_SETTINGS.timezone,
+        exceptionalToleranceMinutes: administrative.exceptionalToleranceMinutes
+      };
+    } else if (journeyObject) {
+      console.info(
+        "[Portal Extensão][background] Jornada administrativa ainda não vigente",
+        { effectiveFrom: administrative.effectiveFrom }
+      );
+    }
+    if (!journeyObject) {
+      journeySettings.exceptionalToleranceMinutes =
+        administrative.exceptionalToleranceMinutes;
+    }
+
+    await aplicarLimiteInatividade(administrative.inactivityMinutes);
+    monitorState.heartbeatFrequencySeconds =
+      administrative.heartbeatFrequencySeconds;
+    await chrome.storage.local.set({
+      journeySettings,
+      journeySettingsCacheUpdatedAt: new Date().toISOString(),
+      inactivityThresholdMinutes: administrative.inactivityMinutes,
+      postWorkInactivityToleranceMinutes: administrative.exceptionalToleranceMinutes,
+      heartbeatFrequencySeconds: administrative.heartbeatFrequencySeconds,
+      activitiesModuleEnabled: administrative.activitiesModuleEnabled,
+      monitorState
+    });
+    await agendarHeartbeatSupabase(
+      administrative.heartbeatFrequencySeconds
+    );
+  } catch (error) {
+    console.warn(
+      "[Portal Extensão][background] Configurações administrativas indisponíveis; usando último cache válido",
+      error
+    );
+  }
+}
+
+    async function persistirEstadoMonitoramento() {
+      await chrome.storage.local.set({ monitorState });
+    }
+
+    async function confirmarHeartbeat(timestamp = Date.now()) {
+      monitorState.lastHeartbeatAt = new Date(timestamp).toISOString();
+      await persistirEstadoMonitoramento();
+      await chrome.alarms.create(HEARTBEAT_ALARM, { delayInMinutes: 0.5 });
+    }
+
+async function agendarHeartbeatSupabase(frequencySeconds) {
+  const seconds = Number(frequencySeconds);
+  const safeSeconds = Number.isFinite(seconds) && seconds >= 5
+    ? seconds
+    : 30;
+  monitorState.heartbeatFrequencySeconds = safeSeconds;
+  await chrome.storage.local.set({ monitorState });
+  await chrome.alarms.create(SUPABASE_HEARTBEAT_ALARM, {
+    periodInMinutes: safeSeconds / 60
+  });
+}
+
+async function enviarHeartbeatSupabase() {
+  try {
+    const authState = await validarSessaoPersistida();
+    if (authState.status !== "authenticated" || !authState.userId) {
+      monitorState.supabaseHeartbeatStatus = "disconnected";
+      monitorState.lastSupabaseHeartbeatError =
+        "Autenticação Supabase indisponível.";
+      await persistirEstadoMonitoramento();
+      return false;
+    }
+
+    const { portalAccessToken } = await chrome.storage.local.get(
+      PORTAL_ACCESS_TOKEN_STORAGE_KEY
+    );
+    if (!portalAccessToken) {
+      throw new Error("Access token autenticado indisponível.");
+    }
+
+    const extensionVersion = chrome.runtime.getManifest().version;
+    const response = await fetch(
+      `${SUPABASE_URL}/rest/v1/extension_heartbeats?on_conflict=user_id`,
+      {
+        method: "POST",
+        signal: AbortSignal.timeout(15_000),
+        headers: {
+          "Authorization": `Bearer ${portalAccessToken}`,
+          "apikey": SUPABASE_KEY,
+          "Content-Type": "application/json",
+          "Prefer": "resolution=merge-duplicates"
+        },
+        body: JSON.stringify({
+          user_id: authState.userId,
+          extension_version: extensionVersion
+        })
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Heartbeat Supabase falhou: ${response.status} ${await response.text()}`
+      );
+    }
+
+    const confirmedAt = new Date().toISOString();
+    monitorState.lastSupabaseHeartbeatAt = confirmedAt;
+    monitorState.lastSupabaseHeartbeatError = null;
+    monitorState.supabaseHeartbeatStatus = "connected";
+    await persistirEstadoMonitoramento();
+    await atualizarStatusSincronizacao({
+      lastSupabaseHeartbeatAt: confirmedAt,
+      supabaseConnectionStatus: "connected"
+    }).catch((error) => {
+      console.error(
+        "[Portal Extensão][heartbeat] Falha ao persistir status de conexão",
+        error
+      );
+    });
+    return true;
+  } catch (error) {
+    monitorState.supabaseHeartbeatStatus = "disconnected";
+    monitorState.lastSupabaseHeartbeatError =
+      error.message || String(error);
+    await persistirEstadoMonitoramento();
+    await atualizarStatusSincronizacao({
+      supabaseConnectionStatus: "disconnected",
+      lastSupabaseHeartbeatError: monitorState.lastSupabaseHeartbeatError
+    }).catch(() => {});
+    console.warn(
+      "[Portal Extensão][heartbeat] Falha na comunicação com Supabase",
+      error
+    );
+    return false;
+  }
+}
+
+    async function validarContinuidade(now = Date.now()) {
+      const previous = monitorState.lastHeartbeatAt
+        ? new Date(monitorState.lastHeartbeatAt).getTime()
+        : null;
+      if (previous !== null && now - previous > HEARTBEAT_TOLERANCE_MS) {
+        const confirmedEnd = previous;
+        monitorState.continuityInterruptedAt = new Date(now).toISOString();
+        if (currentSession) {
+          await encerrarSessao(confirmedEnd, "monitoring_continuity_gap");
+          monitorState.exceptionalStatus = "none";
+        }
+        if (monitorState.exceptionalStatus !== "none") {
+          monitorState.exceptionalStatus = "ended";
+          monitorState.exceptionalEndedAt = new Date(confirmedEnd).toISOString();
+          monitorState.exceptionalEndReason = "monitoring_continuity_gap";
+        }
+        await persistirEstadoMonitoramento();
+      }
+      if (
+        obterTipoJornada(now) === "lunch" &&
+        currentSession?.inactivityStartedAt
+      ) {
+        await finalizarEventoInatividade(now);
+        currentSession.intervalStart = new Date(now).toISOString();
+        currentSession.isActive = true;
+        await persistirSessao();
+        await chrome.alarms.clear(INACTIVITY_ALARM);
+      }
+      await confirmarHeartbeat(now);
+      return true;
+    }
+
     console.error(
       "[Portal Extensão][background] Não foi possível atualizar o limite de inatividade; usando último valor válido",
       error
@@ -1141,8 +1485,48 @@ async function atualizarLimiteInatividade() {
 }
 
 const sessionReady = chrome.storage.local
-  .get(["activeSession", "inactivityThresholdMinutes"])
-  .then(async ({ activeSession, inactivityThresholdMinutes }) => {
+  .get([
+    "activeSession",
+    "inactivityThresholdMinutes",
+    "postWorkInactivityToleranceMinutes",
+    "heartbeatFrequencySeconds",
+    "activitiesModuleEnabled",
+    "journeySettings",
+    "monitorState"
+  ])
+  .then(async ({
+    activeSession,
+    inactivityThresholdMinutes,
+    postWorkInactivityToleranceMinutes,
+    heartbeatFrequencySeconds,
+    activitiesModuleEnabled,
+    journeySettings: cachedJourney,
+    monitorState: cachedMonitorState
+  }) => {
+    if (
+      cachedJourney &&
+      typeof cachedJourney === "object"
+    ) {
+      journeySettings = { ...DEFAULT_JOURNEY_SETTINGS, ...cachedJourney };
+    }
+    if (cachedMonitorState && typeof cachedMonitorState === "object") {
+      monitorState = { ...monitorState, ...cachedMonitorState };
+    }
+    const cachedHeartbeatSeconds = Number(heartbeatFrequencySeconds);
+    if (Number.isFinite(cachedHeartbeatSeconds) && cachedHeartbeatSeconds >= 5) {
+      monitorState.heartbeatFrequencySeconds = cachedHeartbeatSeconds;
+    }
+    const cachedExceptionalMinutes =
+      Number(postWorkInactivityToleranceMinutes);
+    if (
+      Number.isFinite(cachedExceptionalMinutes) &&
+      cachedExceptionalMinutes > 0
+    ) {
+      journeySettings.exceptionalToleranceMinutes = cachedExceptionalMinutes;
+    }
+    if (!monitorState.lastHeartbeatAt) {
+      await confirmarHeartbeat();
+    }
     currentSession = activeSession
       ? {
           ...activeSession,
@@ -1188,6 +1572,16 @@ const sessionReady = chrome.storage.local
     await chrome.alarms.create(OUTBOX_SYNC_ALARM, {
       periodInMinutes: 1
     });
+    await chrome.alarms.create(HEARTBEAT_ALARM, {
+      periodInMinutes: 0.5
+    });
+    await agendarHeartbeatSupabase(
+      monitorState.heartbeatFrequencySeconds || 30
+    );
+    void enviarHeartbeatSupabase();
+    await chrome.alarms.create(JOURNEY_SETTINGS_REFRESH_ALARM, {
+      periodInMinutes: 5
+    });
     if (
       currentSession?.inactivityStartedAt &&
       currentSession.inactivityClientEventId
@@ -1202,6 +1596,7 @@ const sessionReady = chrome.storage.local
     await validarSessaoPersistida();
     void sincronizarOutbox();
     void atualizarLimiteInatividade();
+    void atualizarConfiguracoesAdministrativas();
     const settingsRefreshAlarm = await chrome.alarms.get(
       INACTIVITY_SETTINGS_REFRESH_ALARM
     );
@@ -1242,37 +1637,34 @@ async function persistirSessao() {
 }
 
 async function agendarEncerramento() {
-  if (
-    !currentSession ||
-    !currentSession.isActive ||
-    inactivityThresholdSeconds === null
-  ) {
+  if (!currentSession || !currentSession.isActive) {
     await chrome.alarms.clear(INACTIVITY_ALARM);
     return;
   }
-
-  const deadline =
-    new Date(currentSession.lastActivity).getTime() +
-    inactivityThresholdSeconds * 1000;
-
-  await chrome.alarms.create(INACTIVITY_ALARM, {
-    when: deadline
-  });
+  const jornada = obterTipoJornada();
+  await chrome.alarms.clear(INACTIVITY_ALARM);
+  if (jornada === "regular") {
+    if (inactivityThresholdSeconds === null) {
+      return;
+    }
+    const deadline =
+      new Date(currentSession.lastActivity).getTime() +
+      inactivityThresholdSeconds * 1000;
+    await chrome.alarms.create(INACTIVITY_ALARM, { when: deadline });
+  } else if (jornada === "exceptional") {
+    const toleranceMinutes =
+      journeySettings.exceptionalToleranceMinutes ||
+      EXCEPTIONAL_TIMEOUT_MINUTES;
+    const deadline =
+      new Date(currentSession.lastActivity).getTime() +
+      toleranceMinutes * 60 * 1000;
+    await chrome.alarms.create(INACTIVITY_ALARM, { when: deadline });
+  }
 }
 
 async function encerrarSessao(endTime = Date.now(), reason = "unknown") {
   if (!currentSession) {
     return;
-  }
-
-  if (currentSession.isActive && inactivityThresholdSeconds !== null) {
-    const inactivityDeadline =
-      new Date(currentSession.lastActivity).getTime() +
-      inactivityThresholdSeconds * 1000;
-
-    if (endTime >= inactivityDeadline) {
-      await registrarInatividade(inactivityDeadline);
-    }
   }
 
   const sessao = currentSession;
@@ -1376,6 +1768,7 @@ async function iniciarSessao(tab, startTime = Date.now()) {
 async function registrarTroca(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
+    await validarContinuidade();
 
     if (!tab.active) {
       return;
@@ -1385,9 +1778,10 @@ async function registrarTroca(tabId) {
       await encerrarSessao(Date.now(), "tab_change");
       return;
     }
-
+    if (currentSession?.tabId === tabId && currentSession.url === tab.url) {
+      return;
+    }
     await encerrarSessao(Date.now(), "tab_change");
-    await iniciarSessao(tab);
   } catch (error) {
     console.error("Erro ao registrar troca de aba:", error);
   }
@@ -1424,6 +1818,54 @@ async function registrarTrocaDeIdentidade(userId) {
   }
 }
 
+async function mostrarNotificacaoEncerramento() {
+  if (!chrome.notifications) return false;
+  await chrome.notifications.create(NOTIFICATION_ID, {
+    type: "basic",
+    title: "Encerramento do expediente",
+    message:
+      "Seu horário regular de trabalho foi encerrado. Você ainda está realizando atividades profissionais?",
+    buttons: [
+      { title: "Sim, continuar monitoramento" },
+      { title: "Não, encerrar expediente" }
+    ],
+    requireInteraction: true
+  });
+  return true;
+}
+
+async function confirmarContinuacaoExcepcional() {
+  monitorState.exceptionalStatus = "confirmed";
+  monitorState.exceptionalConfirmedAt = new Date().toISOString();
+  if (!currentSession) {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs.find(
+      (item) => item.url && !item.url.startsWith("chrome://")
+    );
+    if (tab) {
+      await iniciarSessao(tab, Date.now());
+    }
+  } else {
+    const now = Date.now();
+    currentSession.lastActivity = new Date(now).toISOString();
+    await persistirSessao();
+    await agendarEncerramento();
+  }
+  await persistirEstadoMonitoramento();
+  await chrome.notifications?.clear(NOTIFICATION_ID);
+}
+
+async function encerrarExcepcional(reason = "user_manual") {
+  monitorState.exceptionalStatus = "ended";
+  monitorState.exceptionalEndedAt = new Date().toISOString();
+  monitorState.exceptionalEndReason = reason;
+  monitorState.exceptionalPromptShownForSession =
+    monitorState.exceptionalPromptShownForSession || "ended";
+  await encerrarSessao(Date.now(), reason);
+  await persistirEstadoMonitoramento();
+  await chrome.notifications?.clear(NOTIFICATION_ID);
+}
+
 async function registrarInteracao(
   tabId,
   interaction = "unknown",
@@ -1431,12 +1873,55 @@ async function registrarInteracao(
   screenName = null,
   screenContext = null
 ) {
+  await validarContinuidade();
   const tab = await chrome.tabs.get(tabId);
   if (!tab.active) {
     return;
   }
 
   const now = Date.now();
+  monitorState.lastInteractionAt = new Date(now).toISOString();
+  const jornada = obterTipoJornada(now);
+  if (jornada === "outside") {
+    await persistirEstadoMonitoramento();
+    return;
+  }
+  if (jornada === "exceptional") {
+    if (monitorState.exceptionalStatus === "ended") {
+      monitorState.exceptionalStatus = "pending";
+      monitorState.exceptionalPromptShownForSession =
+        String(now);
+      if (currentSession) {
+        currentSession.lastActivity = new Date(now).toISOString();
+        await persistirSessao();
+        await agendarEncerramento();
+      }
+      await mostrarNotificacaoEncerramento();
+      await persistirEstadoMonitoramento();
+      return;
+    }
+    if (monitorState.exceptionalStatus === "pending") {
+      if (currentSession) {
+        currentSession.lastActivity = new Date(now).toISOString();
+        await persistirSessao();
+        await agendarEncerramento();
+      }
+      await persistirEstadoMonitoramento();
+      return;
+    }
+    if (monitorState.exceptionalStatus === "none") {
+      monitorState.exceptionalStatus = "pending";
+      monitorState.exceptionalPromptShownForSession =
+        String(currentSession?.inicio || now);
+      await mostrarNotificacaoEncerramento();
+    }
+    if (
+      monitorState.exceptionalStatus === "ended"
+    ) {
+      await persistirEstadoMonitoramento();
+      return;
+    }
+  }
 
   if (currentSession?.tabId !== tabId) {
     await encerrarSessao(now, "tab_change");
@@ -1477,7 +1962,11 @@ async function registrarInteracao(
     }
   );
 
-  if (currentSession.isActive) {
+  if (
+    currentSession.isActive &&
+    obterTipoJornada(now) === "regular" &&
+    inactivityThresholdSeconds !== null
+  ) {
     const inactivityDeadline =
       new Date(currentSession.lastActivity).getTime() +
       (inactivityThresholdSeconds ?? Infinity) * 1000;
@@ -1967,7 +2456,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       }
 
       if (changeInfo.status === "complete") {
-        await registrarTroca(tabId);
+        if (currentSession?.tabId === tabId) {
+          const pageUrl = tab?.url || changeInfo.url || currentSession.url;
+          currentSession.url = pageUrl;
+          currentSession.titulo =
+            obterTituloSeguro(pageUrl, tab?.title || currentSession.titulo) || "";
+          await persistirSessao();
+        }
       }
     });
   }
@@ -2014,6 +2509,21 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     return;
   }
 
+  if (alarm.name === HEARTBEAT_ALARM) {
+    void serializarOperacao(() => validarContinuidade());
+    return;
+  }
+
+  if (alarm.name === SUPABASE_HEARTBEAT_ALARM) {
+    void enviarHeartbeatSupabase();
+    return;
+  }
+
+  if (alarm.name === JOURNEY_SETTINGS_REFRESH_ALARM) {
+    void serializarOperacao(() => atualizarConfiguracoesAdministrativas());
+    return;
+  }
+
   if (alarm.name === PORTAL_AUTH_EXPIRY_ALARM) {
     void validarSessaoPersistida()
       .then((authState) => {
@@ -2031,7 +2541,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   if (alarm.name === INACTIVITY_SETTINGS_REFRESH_ALARM) {
-    void serializarOperacao(() => atualizarLimiteInatividade());
+    void serializarOperacao(() => atualizarConfiguracoesAdministrativas());
     return;
   }
 
@@ -2040,20 +2550,43 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 
   void serializarOperacao(async () => {
-    if (!currentSession || inactivityThresholdSeconds === null) {
+    await validarContinuidade();
+    if (!currentSession) {
       return;
     }
+    const jornada = obterTipoJornada(Date.now());
+    if (jornada === "lunch" || jornada === "outside") {
+      await chrome.alarms.clear(INACTIVITY_ALARM);
+      return;
+    }
+    if (jornada === "regular") {
+      if (inactivityThresholdSeconds === null) {
+        await chrome.alarms.clear(INACTIVITY_ALARM);
+        return;
+      }
+      const deadline =
+        new Date(currentSession.lastActivity).getTime() +
+        inactivityThresholdSeconds * 1000;
+      if (Date.now() < deadline) {
+        await agendarEncerramento();
+        return;
+      }
+      await registrarInatividade(deadline);
+      return;
+    }
+    const toleranceMinutes =
+      journeySettings.exceptionalToleranceMinutes ||
+      EXCEPTIONAL_TIMEOUT_MINUTES;
 
     const deadline =
       new Date(currentSession.lastActivity).getTime() +
-      inactivityThresholdSeconds * 1000;
+      toleranceMinutes * 60 * 1000;
 
     if (Date.now() < deadline) {
       await agendarEncerramento();
       return;
     }
-
-    await registrarInatividade(deadline);
+    await encerrarExcepcional("exceptional_timeout_no_interaction");
   });
 });
 
@@ -2066,10 +2599,14 @@ chrome.idle.onStateChanged.addListener((state) => {
   }
 
   void serializarOperacao(async () => {
+    await validarContinuidade();
     if (!currentSession?.isActive) {
       return;
     }
-
+    if (obterTipoJornada(Date.now()) !== "regular") {
+      await chrome.alarms.clear(INACTIVITY_ALARM);
+      return;
+    }
     await registrarInatividade(Date.now());
   });
 });
@@ -2079,14 +2616,38 @@ chrome.runtime.onStartup.addListener(() => {
     if (!currentSession) {
       return;
     }
-
-    // Do not count time while the browser was closed.
-    await encerrarSessao(
-      new Date(currentSession.lastActivity).getTime(),
-      "browser_startup"
-    );
+    await validarContinuidade();
+    if (currentSession) {
+      await encerrarSessao(
+        monitorState.lastHeartbeatAt
+          ? new Date(monitorState.lastHeartbeatAt).getTime()
+          : new Date(currentSession.lastActivity).getTime(),
+        "browser_startup"
+      );
+    }
+    monitorState.exceptionalStatus = "none";
+    monitorState.exceptionalPromptShownForSession = null;
+    await persistirEstadoMonitoramento();
   });
 });
+
+if (chrome.notifications) {
+  chrome.notifications.onButtonClicked.addListener(
+    (notificationId, buttonIndex) => {
+      if (notificationId !== NOTIFICATION_ID) return;
+      void serializarOperacao(async () => {
+        if (buttonIndex === 0) {
+          await confirmarContinuacaoExcepcional();
+        } else if (buttonIndex === 1) {
+          await encerrarExcepcional("exceptional_manual_close");
+        }
+      });
+    }
+  );
+  chrome.notifications.onClosed.addListener((notificationId) => {
+    if (notificationId !== NOTIFICATION_ID) return;
+  });
+}
 
 chrome.runtime.onMessage.addListener(
   (message, sender, sendResponse) => {
@@ -2108,6 +2669,43 @@ chrome.runtime.onMessage.addListener(
             error: error.message || String(error)
           });
         });
+      return true;
+    }
+
+    if (message?.type === "PORTAL_GET_MONITOR_STATUS") {
+      if (sender.id !== chrome.runtime.id) {
+        sendResponse({ ok: false });
+        return;
+      }
+      sendResponse({
+        ok: true,
+        status: {
+          session: currentSession,
+          monitorState,
+          journeySettings,
+          journeyType: obterTipoJornada(),
+          inactivityThresholdSeconds
+        }
+      });
+      return;
+    }
+
+    if (
+      message?.type === "PORTAL_EXCEPTIONAL_CONFIRM" ||
+      message?.type === "PORTAL_EXCEPTIONAL_END"
+    ) {
+      if (sender.id !== chrome.runtime.id) {
+        sendResponse({ ok: false });
+        return;
+      }
+      void serializarOperacao(async () => {
+        if (message.type === "PORTAL_EXCEPTIONAL_CONFIRM") {
+          await confirmarContinuacaoExcepcional();
+        } else {
+          await encerrarExcepcional("exceptional_manual_close_popup");
+        }
+        sendResponse({ ok: true });
+      });
       return true;
     }
 
